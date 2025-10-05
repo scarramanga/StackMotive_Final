@@ -1,0 +1,34 @@
+version: '3.8'
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    networks:
+      - stackmotive-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./stackmotive.db
+      - SECRET_KEY=your-secret-key-here
+      - CORS_ORIGINS=http://localhost:3000
+    volumes:
+      - ./server:/app/server
+      - ./data:/app/data
+    networks:
+      - stackmotive-network
+
+networks:
+  stackmotive-network:
+    driver: bridge
