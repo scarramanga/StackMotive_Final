@@ -1,0 +1,1835 @@
+From b33b377a63cbb4d7270196b3e9ec6c9ac6be6924 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:56 +0000
+Subject: [PATCH 01/11] feat: Add PostgreSQL authentication schema with users
+ and sessions tables
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/01_authentication.sql | 77 +++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+ create mode 100644 server/database/schemas/01_authentication.sql
+
+diff --git a/server/database/schemas/01_authentication.sql b/server/database/schemas/01_authentication.sql
+new file mode 100644
+index 0000000..ebd829b
+--- /dev/null
++++ b/server/database/schemas/01_authentication.sql
+@@ -0,0 +1,77 @@
++
++CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
++
++
++CREATE TABLE users (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    email VARCHAR(255) NOT NULL UNIQUE,
++    hashed_password VARCHAR(255) NOT NULL,
++    
++    tier VARCHAR(50) NOT NULL DEFAULT 'observer',
++    is_active BOOLEAN NOT NULL DEFAULT TRUE,
++    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
++    
++    has_completed_onboarding BOOLEAN NOT NULL DEFAULT FALSE,
++    onboarding_step INTEGER DEFAULT 0,
++    onboarding_completed_at TIMESTAMPTZ,
++    
++    preferred_currency VARCHAR(10) DEFAULT 'USD',
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT users_email_check CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}$'),
++    CONSTRAINT users_tier_check CHECK (tier IN ('observer', 'trader', 'professional', 'enterprise')),
++    CONSTRAINT users_currency_check CHECK (preferred_currency IN ('USD', 'NZD', 'AUD', 'EUR', 'GBP'))
++);
++
++CREATE INDEX idx_users_email ON users(email);
++CREATE INDEX idx_users_tier ON users(tier);
++CREATE INDEX idx_users_active ON users(is_active) WHERE is_active = TRUE;
++CREATE INDEX idx_users_created_at ON users(created_at DESC);
++
++COMMENT ON TABLE users IS 'Core user accounts with authentication and profile information';
++COMMENT ON COLUMN users.tier IS 'Subscription tier: observer (free), trader, professional, enterprise';
++COMMENT ON COLUMN users.is_active IS 'Whether the user account is active';
++COMMENT ON COLUMN users.is_admin IS 'Whether the user has admin privileges';
++
++
++CREATE TABLE user_sessions (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    session_token VARCHAR(500) NOT NULL UNIQUE,
++    refresh_token VARCHAR(500),
++    device_info JSONB,
++    ip_address INET,
++    user_agent TEXT,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    expires_at TIMESTAMPTZ NOT NULL,
++    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    revoked_at TIMESTAMPTZ,
++    is_active BOOLEAN NOT NULL DEFAULT TRUE
++);
++
++CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);
++CREATE INDEX idx_user_sessions_token ON user_sessions(session_token);
++CREATE INDEX idx_user_sessions_active ON user_sessions(user_id, is_active) WHERE is_active = TRUE;
++CREATE INDEX idx_user_sessions_expires ON user_sessions(expires_at);
++
++COMMENT ON TABLE user_sessions IS 'User authentication sessions (for future session management)';
++COMMENT ON COLUMN user_sessions.session_token IS 'JWT access token (hashed)';
++COMMENT ON COLUMN user_sessions.refresh_token IS 'JWT refresh token (hashed)';
++
++
++CREATE OR REPLACE FUNCTION update_updated_at_column()
++RETURNS TRIGGER AS $$
++BEGIN
++    NEW.updated_at = CURRENT_TIMESTAMP;
++    RETURN NEW;
++END;
++$$ LANGUAGE plpgsql;
++
++CREATE TRIGGER update_users_updated_at
++    BEFORE UPDATE ON users
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From 8fc0d2ed77c4284a0002e82853324a8a0854d17f Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:57 +0000
+Subject: [PATCH 02/11] feat: Add PostgreSQL portfolio schema with summary,
+ holdings, positions, and sync log tables
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/02_portfolio.sql | 168 +++++++++++++++++++++++
+ 1 file changed, 168 insertions(+)
+ create mode 100644 server/database/schemas/02_portfolio.sql
+
+diff --git a/server/database/schemas/02_portfolio.sql b/server/database/schemas/02_portfolio.sql
+new file mode 100644
+index 0000000..a19142f
+--- /dev/null
++++ b/server/database/schemas/02_portfolio.sql
+@@ -0,0 +1,168 @@
++
++
++CREATE TABLE portfolio_summary (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    vault_id VARCHAR(100) NOT NULL,
++    
++    portfolio_value DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    total_gain_loss DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    total_gain_loss_percent DECIMAL(10, 4) NOT NULL DEFAULT 0.0000,
++    day_gain_loss DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    day_gain_loss_percent DECIMAL(10, 4) NOT NULL DEFAULT 0.0000,
++    
++    cash_balance DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    invested_amount DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    number_of_holdings INTEGER NOT NULL DEFAULT 0,
++    
++    last_updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT portfolio_summary_unique_user_vault UNIQUE(user_id, vault_id),
++    CONSTRAINT portfolio_summary_value_positive CHECK (portfolio_value >= 0),
++    CONSTRAINT portfolio_summary_holdings_positive CHECK (number_of_holdings >= 0)
++);
++
++CREATE INDEX idx_portfolio_summary_user_id ON portfolio_summary(user_id);
++CREATE INDEX idx_portfolio_summary_vault_id ON portfolio_summary(vault_id);
++CREATE INDEX idx_portfolio_summary_user_vault ON portfolio_summary(user_id, vault_id);
++CREATE INDEX idx_portfolio_summary_last_updated ON portfolio_summary(last_updated DESC);
++
++COMMENT ON TABLE portfolio_summary IS 'High-level portfolio metrics and summary data per vault';
++COMMENT ON COLUMN portfolio_summary.vault_id IS 'Portfolio/vault identifier for multi-portfolio support';
++COMMENT ON COLUMN portfolio_summary.portfolio_value IS 'Total current market value of portfolio';
++COMMENT ON COLUMN portfolio_summary.invested_amount IS 'Total amount invested (cost basis)';
++
++
++CREATE TABLE portfolio_holdings (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    vault_id VARCHAR(100),
++    
++    symbol VARCHAR(20) NOT NULL,
++    asset_name VARCHAR(255),
++    asset_class VARCHAR(50) NOT NULL DEFAULT 'equity',
++    allocation_type VARCHAR(50),
++    
++    quantity DECIMAL(20, 8) NOT NULL,
++    avg_cost DECIMAL(20, 4) NOT NULL,
++    current_price DECIMAL(20, 4) NOT NULL,
++    market_value DECIMAL(20, 2) NOT NULL,
++    
++    total_gain_loss DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    total_gain_loss_percent DECIMAL(10, 4) NOT NULL DEFAULT 0.0000,
++    day_gain_loss DECIMAL(20, 2) NOT NULL DEFAULT 0.00,
++    day_gain_loss_percent DECIMAL(10, 4) NOT NULL DEFAULT 0.0000,
++    
++    last_updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT portfolio_holdings_quantity_positive CHECK (quantity > 0),
++    CONSTRAINT portfolio_holdings_asset_class_check CHECK (
++        asset_class IN ('equity', 'crypto', 'bond', 'cash', 'fund', 'commodity', 'alternative')
++    )
++);
++
++CREATE INDEX idx_portfolio_holdings_user_id ON portfolio_holdings(user_id);
++CREATE INDEX idx_portfolio_holdings_vault_id ON portfolio_holdings(vault_id);
++CREATE INDEX idx_portfolio_holdings_symbol ON portfolio_holdings(symbol);
++CREATE INDEX idx_portfolio_holdings_user_vault ON portfolio_holdings(user_id, vault_id);
++CREATE INDEX idx_portfolio_holdings_asset_class ON portfolio_holdings(asset_class);
++CREATE INDEX idx_portfolio_holdings_last_updated ON portfolio_holdings(last_updated DESC);
++
++COMMENT ON TABLE portfolio_holdings IS 'Individual asset positions within portfolios';
++COMMENT ON COLUMN portfolio_holdings.symbol IS 'Asset ticker symbol';
++COMMENT ON COLUMN portfolio_holdings.quantity IS 'Number of shares/units held (supports fractional)';
++COMMENT ON COLUMN portfolio_holdings.asset_class IS 'Asset classification for allocation analysis';
++
++
++CREATE TABLE portfolio_position (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    symbol VARCHAR(20) NOT NULL,
++    name VARCHAR(255),
++    
++    quantity DECIMAL(20, 8) NOT NULL,
++    avg_price DECIMAL(20, 4) NOT NULL,
++    current_price DECIMAL(20, 4),
++    
++    asset_class VARCHAR(50) NOT NULL DEFAULT 'equity',
++    account VARCHAR(100) NOT NULL,
++    currency VARCHAR(10) NOT NULL DEFAULT 'USD',
++    
++    sync_source VARCHAR(50) NOT NULL,
++    last_updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT portfolio_position_unique_user_symbol_account UNIQUE(user_id, symbol, account),
++    CONSTRAINT portfolio_position_quantity_positive CHECK (quantity > 0),
++    CONSTRAINT portfolio_position_asset_class_check CHECK (
++        asset_class IN ('equity', 'crypto', 'fund', 'bond', 'cash', 'commodity', 'alternative')
++    ),
++    CONSTRAINT portfolio_position_sync_source_check CHECK (
++        sync_source IN ('csv', 'ibkr', 'kucoin', 'kraken', 'tiger', 'manual')
++    )
++);
++
++CREATE INDEX idx_portfolio_position_user_id ON portfolio_position(user_id);
++CREATE INDEX idx_portfolio_position_symbol ON portfolio_position(symbol);
++CREATE INDEX idx_portfolio_position_account ON portfolio_position(account);
++CREATE INDEX idx_portfolio_position_sync_source ON portfolio_position(sync_source);
++CREATE INDEX idx_portfolio_position_user_symbol ON portfolio_position(user_id, symbol);
++
++COMMENT ON TABLE portfolio_position IS 'Detailed position tracking with broker synchronization metadata';
++COMMENT ON COLUMN portfolio_position.sync_source IS 'Source of position data: csv, ibkr, kucoin, kraken, tiger, manual';
++COMMENT ON COLUMN portfolio_position.account IS 'Account/broker name for multi-account support';
++
++
++CREATE TABLE portfolio_sync_log (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    sync_source VARCHAR(50) NOT NULL,
++    status VARCHAR(20) NOT NULL,
++    records_imported INTEGER NOT NULL DEFAULT 0,
++    error_message TEXT,
++    filename VARCHAR(500),
++    
++    sync_started TIMESTAMPTZ NOT NULL,
++    sync_completed TIMESTAMPTZ NOT NULL,
++    
++    metadata JSONB,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT portfolio_sync_log_status_check CHECK (
++        status IN ('success', 'error', 'partial', 'pending')
++    ),
++    CONSTRAINT portfolio_sync_log_records_positive CHECK (records_imported >= 0),
++    CONSTRAINT portfolio_sync_log_sync_source_check CHECK (
++        sync_source IN ('csv', 'ibkr', 'kucoin', 'kraken', 'tiger', 'manual')
++    )
++);
++
++CREATE INDEX idx_portfolio_sync_log_user_id ON portfolio_sync_log(user_id);
++CREATE INDEX idx_portfolio_sync_log_source ON portfolio_sync_log(sync_source);
++CREATE INDEX idx_portfolio_sync_log_status ON portfolio_sync_log(status);
++CREATE INDEX idx_portfolio_sync_log_created ON portfolio_sync_log(created_at DESC);
++CREATE INDEX idx_portfolio_sync_log_user_time ON portfolio_sync_log(user_id, created_at DESC);
++
++COMMENT ON TABLE portfolio_sync_log IS 'Audit trail of portfolio synchronization operations';
++COMMENT ON COLUMN portfolio_sync_log.status IS 'Sync result: success, error, partial, pending';
++COMMENT ON COLUMN portfolio_sync_log.metadata IS 'Additional sync details in JSON format';
++
++
++CREATE TRIGGER update_portfolio_summary_updated_at
++    BEFORE UPDATE ON portfolio_summary
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_portfolio_holdings_updated_at
++    BEFORE UPDATE ON portfolio_holdings
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_portfolio_position_updated_at
++    BEFORE UPDATE ON portfolio_position
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From 20716c0ba1e8352e32c6268786a2432c6faa9f60 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:57 +0000
+Subject: [PATCH 03/11] feat: Add PostgreSQL trading automation schema with DCA
+ and Stop-Loss rules
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/03_trading.sql | 54 ++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+ create mode 100644 server/database/schemas/03_trading.sql
+
+diff --git a/server/database/schemas/03_trading.sql b/server/database/schemas/03_trading.sql
+new file mode 100644
+index 0000000..9ae39e0
+--- /dev/null
++++ b/server/database/schemas/03_trading.sql
+@@ -0,0 +1,54 @@
++
++
++CREATE TABLE user_trade_rule (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    symbol VARCHAR(20) NOT NULL,
++    
++    rule_type VARCHAR(20) NOT NULL,
++    threshold DECIMAL(20, 4) NOT NULL,
++    frequency VARCHAR(20),
++    amount DECIMAL(20, 2),
++    
++    enabled BOOLEAN NOT NULL DEFAULT TRUE,
++    last_triggered TIMESTAMPTZ,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT user_trade_rule_type_check CHECK (rule_type IN ('DCA', 'Stop-Loss')),
++    CONSTRAINT user_trade_rule_frequency_check CHECK (
++        frequency IS NULL OR frequency IN ('daily', 'weekly', 'biweekly', 'monthly', 'quarterly')
++    ),
++    CONSTRAINT user_trade_rule_threshold_positive CHECK (threshold > 0),
++    CONSTRAINT user_trade_rule_amount_positive CHECK (amount IS NULL OR amount > 0),
++    CONSTRAINT user_trade_rule_dca_requires_frequency CHECK (
++        rule_type != 'DCA' OR frequency IS NOT NULL
++    ),
++    CONSTRAINT user_trade_rule_dca_requires_amount CHECK (
++        rule_type != 'DCA' OR amount IS NOT NULL
++    )
++);
++
++CREATE INDEX idx_user_trade_rule_user_id ON user_trade_rule(user_id);
++CREATE INDEX idx_user_trade_rule_symbol ON user_trade_rule(symbol);
++CREATE INDEX idx_user_trade_rule_type ON user_trade_rule(rule_type);
++CREATE INDEX idx_user_trade_rule_enabled ON user_trade_rule(enabled) WHERE enabled = TRUE;
++CREATE INDEX idx_user_trade_rule_user_symbol ON user_trade_rule(user_id, symbol);
++CREATE INDEX idx_user_trade_rule_user_symbol_type ON user_trade_rule(user_id, symbol, rule_type);
++CREATE INDEX idx_user_trade_rule_last_triggered ON user_trade_rule(last_triggered DESC);
++
++COMMENT ON TABLE user_trade_rule IS 'DCA and Stop-Loss trading automation rules';
++COMMENT ON COLUMN user_trade_rule.rule_type IS 'Type of automation: DCA (Dollar Cost Averaging) or Stop-Loss';
++COMMENT ON COLUMN user_trade_rule.threshold IS 'Target price for DCA or stop percentage for Stop-Loss';
++COMMENT ON COLUMN user_trade_rule.frequency IS 'DCA frequency: daily, weekly, biweekly, monthly, quarterly';
++COMMENT ON COLUMN user_trade_rule.amount IS 'Dollar amount to invest for DCA rules';
++COMMENT ON COLUMN user_trade_rule.enabled IS 'Whether the rule is currently active';
++COMMENT ON COLUMN user_trade_rule.last_triggered IS 'Last time this rule was executed';
++
++
++CREATE TRIGGER update_user_trade_rule_updated_at
++    BEFORE UPDATE ON user_trade_rule
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From 582579d3e4ffd081c473589ce66b65690739b23d Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:57 +0000
+Subject: [PATCH 04/11] feat: Add PostgreSQL rebalancing schema with schedules
+ and execution history
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/04_rebalancing.sql | 91 ++++++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+ create mode 100644 server/database/schemas/04_rebalancing.sql
+
+diff --git a/server/database/schemas/04_rebalancing.sql b/server/database/schemas/04_rebalancing.sql
+new file mode 100644
+index 0000000..3c651e5
+--- /dev/null
++++ b/server/database/schemas/04_rebalancing.sql
+@@ -0,0 +1,91 @@
++
++
++CREATE TABLE rebalance_schedule (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    enabled BOOLEAN NOT NULL DEFAULT TRUE,
++    frequency VARCHAR(20) NOT NULL DEFAULT 'manual',
++    threshold DECIMAL(10, 4) NOT NULL DEFAULT 5.0,
++    only_if_thresholds_exceeded BOOLEAN NOT NULL DEFAULT TRUE,
++    
++    day_of_week INTEGER,
++    day_of_month INTEGER,
++    time_of_day TIME NOT NULL DEFAULT '09:30:00',
++    exclude_weekends BOOLEAN NOT NULL DEFAULT TRUE,
++    
++    allow_partial_rebalancing BOOLEAN NOT NULL DEFAULT FALSE,
++    max_trades_per_session INTEGER NOT NULL DEFAULT 10,
++    
++    last_rebalance_time TIMESTAMPTZ,
++    next_scheduled_time TIMESTAMPTZ,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT rebalance_schedule_unique_user UNIQUE(user_id),
++    CONSTRAINT rebalance_schedule_frequency_check CHECK (
++        frequency IN ('manual', 'daily', 'weekly', 'biweekly', 'monthly', 'quarterly', 'annually')
++    ),
++    CONSTRAINT rebalance_schedule_threshold_check CHECK (threshold >= 0 AND threshold <= 100),
++    CONSTRAINT rebalance_schedule_day_of_week_check CHECK (
++        day_of_week IS NULL OR (day_of_week >= 0 AND day_of_week <= 6)
++    ),
++    CONSTRAINT rebalance_schedule_day_of_month_check CHECK (
++        day_of_month IS NULL OR (day_of_month >= 1 AND day_of_month <= 31)
++    ),
++    CONSTRAINT rebalance_schedule_max_trades_positive CHECK (max_trades_per_session > 0)
++);
++
++CREATE INDEX idx_rebalance_schedule_user_id ON rebalance_schedule(user_id);
++CREATE INDEX idx_rebalance_schedule_enabled ON rebalance_schedule(enabled) WHERE enabled = TRUE;
++CREATE INDEX idx_rebalance_schedule_next_scheduled ON rebalance_schedule(next_scheduled_time);
++CREATE INDEX idx_rebalance_schedule_frequency ON rebalance_schedule(frequency);
++
++COMMENT ON TABLE rebalance_schedule IS 'User-configured automatic portfolio rebalancing schedules';
++COMMENT ON COLUMN rebalance_schedule.frequency IS 'Rebalancing frequency: manual, daily, weekly, biweekly, monthly, quarterly, annually';
++COMMENT ON COLUMN rebalance_schedule.threshold IS 'Portfolio drift percentage that triggers rebalancing (0-100)';
++COMMENT ON COLUMN rebalance_schedule.day_of_week IS 'Day of week for weekly rebalancing (0=Monday, 6=Sunday)';
++COMMENT ON COLUMN rebalance_schedule.day_of_month IS 'Day of month for monthly rebalancing (1-31)';
++COMMENT ON COLUMN rebalance_schedule.only_if_thresholds_exceeded IS 'Only rebalance if drift exceeds threshold';
++
++
++CREATE TABLE rebalance_execution (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    schedule_id UUID REFERENCES rebalance_schedule(id) ON DELETE SET NULL,
++    
++    execution_type VARCHAR(30) NOT NULL,
++    portfolio_value_before DECIMAL(20, 2) NOT NULL,
++    total_drift_percent DECIMAL(10, 4) NOT NULL,
++    trades_executed INTEGER NOT NULL DEFAULT 0,
++    
++    completed_successfully BOOLEAN NOT NULL,
++    error_message TEXT,
++    
++    executed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT rebalance_execution_type_check CHECK (
++        execution_type IN ('scheduled', 'manual', 'threshold_triggered', 'api_triggered')
++    ),
++    CONSTRAINT rebalance_execution_portfolio_positive CHECK (portfolio_value_before >= 0),
++    CONSTRAINT rebalance_execution_trades_positive CHECK (trades_executed >= 0)
++);
++
++CREATE INDEX idx_rebalance_execution_user_id ON rebalance_execution(user_id);
++CREATE INDEX idx_rebalance_execution_schedule_id ON rebalance_execution(schedule_id);
++CREATE INDEX idx_rebalance_execution_executed_at ON rebalance_execution(executed_at DESC);
++CREATE INDEX idx_rebalance_execution_user_time ON rebalance_execution(user_id, executed_at DESC);
++CREATE INDEX idx_rebalance_execution_type ON rebalance_execution(execution_type);
++CREATE INDEX idx_rebalance_execution_success ON rebalance_execution(completed_successfully);
++
++COMMENT ON TABLE rebalance_execution IS 'History of portfolio rebalancing executions';
++COMMENT ON COLUMN rebalance_execution.execution_type IS 'What triggered the rebalance: scheduled, manual, threshold_triggered, api_triggered';
++COMMENT ON COLUMN rebalance_execution.total_drift_percent IS 'Portfolio drift percentage at time of rebalancing';
++COMMENT ON COLUMN rebalance_execution.trades_executed IS 'Number of trades executed during rebalancing';
++
++
++CREATE TRIGGER update_rebalance_schedule_updated_at
++    BEFORE UPDATE ON rebalance_schedule
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From c6ce03670075fa90d56d6bdcc14eeb6edee4b96b Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:58 +0000
+Subject: [PATCH 05/11] feat: Add PostgreSQL watchlists schema with items and
+ sharing capabilities
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/05_watchlists.sql | 83 +++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+ create mode 100644 server/database/schemas/05_watchlists.sql
+
+diff --git a/server/database/schemas/05_watchlists.sql b/server/database/schemas/05_watchlists.sql
+new file mode 100644
+index 0000000..f8412aa
+--- /dev/null
++++ b/server/database/schemas/05_watchlists.sql
+@@ -0,0 +1,83 @@
++
++
++CREATE TABLE watchlists (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    name VARCHAR(255) NOT NULL,
++    description TEXT,
++    is_public BOOLEAN NOT NULL DEFAULT FALSE,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT watchlists_name_not_empty CHECK (LENGTH(TRIM(name)) > 0)
++);
++
++CREATE INDEX idx_watchlists_owner_id ON watchlists(owner_id);
++CREATE INDEX idx_watchlists_is_public ON watchlists(is_public) WHERE is_public = TRUE;
++CREATE INDEX idx_watchlists_created_at ON watchlists(created_at DESC);
++CREATE INDEX idx_watchlists_name ON watchlists(name);
++
++COMMENT ON TABLE watchlists IS 'User-created watchlists for tracking assets';
++COMMENT ON COLUMN watchlists.is_public IS 'Whether the watchlist is publicly visible';
++COMMENT ON COLUMN watchlists.owner_id IS 'User who created the watchlist';
++
++
++CREATE TABLE watchlist_items (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    watchlist_id UUID NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
++    
++    symbol VARCHAR(20) NOT NULL,
++    name VARCHAR(255),
++    
++    price DECIMAL(20, 4),
++    change_24h DECIMAL(10, 4) DEFAULT 0,
++    market_cap DECIMAL(30, 2),
++    
++    notes TEXT,
++    
++    added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT watchlist_items_symbol_not_empty CHECK (LENGTH(TRIM(symbol)) > 0)
++);
++
++CREATE INDEX idx_watchlist_items_watchlist_id ON watchlist_items(watchlist_id);
++CREATE INDEX idx_watchlist_items_symbol ON watchlist_items(symbol);
++CREATE INDEX idx_watchlist_items_added_at ON watchlist_items(added_at DESC);
++
++COMMENT ON TABLE watchlist_items IS 'Assets within watchlists';
++COMMENT ON COLUMN watchlist_items.price IS 'Cached current price (updated periodically)';
++COMMENT ON COLUMN watchlist_items.change_24h IS '24-hour price change percentage';
++COMMENT ON COLUMN watchlist_items.notes IS 'User notes about this asset';
++
++
++CREATE TABLE watchlist_shares (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    watchlist_id UUID NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
++    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    shared_with_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    is_read_only BOOLEAN NOT NULL DEFAULT FALSE,
++    
++    shared_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT watchlist_shares_unique_share UNIQUE(watchlist_id, shared_with_id),
++    CONSTRAINT watchlist_shares_no_self_share CHECK (owner_id != shared_with_id)
++);
++
++CREATE INDEX idx_watchlist_shares_watchlist_id ON watchlist_shares(watchlist_id);
++CREATE INDEX idx_watchlist_shares_owner_id ON watchlist_shares(owner_id);
++CREATE INDEX idx_watchlist_shares_shared_with_id ON watchlist_shares(shared_with_id);
++CREATE INDEX idx_watchlist_shares_shared_at ON watchlist_shares(shared_at DESC);
++
++COMMENT ON TABLE watchlist_shares IS 'Watchlist sharing permissions between users';
++COMMENT ON COLUMN watchlist_shares.is_read_only IS 'Whether the recipient can only view or also edit';
++COMMENT ON COLUMN watchlist_shares.owner_id IS 'User who owns the watchlist';
++COMMENT ON COLUMN watchlist_shares.shared_with_id IS 'User the watchlist is shared with';
++
++
++CREATE TRIGGER update_watchlists_updated_at
++    BEFORE UPDATE ON watchlists
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From f34d2df298bf9c5d262b2c538078a52d9128c4e1 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:58 +0000
+Subject: [PATCH 06/11] feat: Add PostgreSQL preferences schema with user and
+ theme preferences
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/06_preferences.sql | 116 +++++++++++++++++++++
+ 1 file changed, 116 insertions(+)
+ create mode 100644 server/database/schemas/06_preferences.sql
+
+diff --git a/server/database/schemas/06_preferences.sql b/server/database/schemas/06_preferences.sql
+new file mode 100644
+index 0000000..b37adf0
+--- /dev/null
++++ b/server/database/schemas/06_preferences.sql
+@@ -0,0 +1,116 @@
++
++
++CREATE TABLE user_preferences (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
++    
++    theme VARCHAR(20) DEFAULT 'system',
++    language VARCHAR(10) DEFAULT 'en',
++    timezone VARCHAR(50) DEFAULT 'UTC',
++    date_format VARCHAR(20) DEFAULT 'YYYY-MM-DD',
++    time_format VARCHAR(10) DEFAULT '24h',
++    number_format VARCHAR(10) DEFAULT 'en-US',
++    chart_type VARCHAR(20) DEFAULT 'candlestick',
++    chart_timeframe VARCHAR(10) DEFAULT '1D',
++    default_view VARCHAR(50) DEFAULT 'overview',
++    
++    data_refresh_interval INTEGER DEFAULT 30,
++    real_time_data BOOLEAN DEFAULT TRUE,
++    historical_data_range VARCHAR(10) DEFAULT '1Y',
++    price_display_mode VARCHAR(20) DEFAULT 'live',
++    
++    email_notifications BOOLEAN DEFAULT TRUE,
++    push_notifications BOOLEAN DEFAULT TRUE,
++    sms_notifications BOOLEAN DEFAULT FALSE,
++    alert_threshold DECIMAL(10, 4) DEFAULT 5.0,
++    
++    default_order_type VARCHAR(20) DEFAULT 'market',
++    confirm_orders BOOLEAN DEFAULT TRUE,
++    show_risk_warnings BOOLEAN DEFAULT TRUE,
++    
++    api_access_enabled BOOLEAN DEFAULT FALSE,
++    webhook_url VARCHAR(500),
++    custom_css_enabled BOOLEAN DEFAULT FALSE,
++    beta_features BOOLEAN DEFAULT FALSE,
++    developer_mode BOOLEAN DEFAULT FALSE,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT user_preferences_theme_check CHECK (theme IN ('light', 'dark', 'system')),
++    CONSTRAINT user_preferences_time_format_check CHECK (time_format IN ('12h', '24h')),
++    CONSTRAINT user_preferences_chart_type_check CHECK (
++        chart_type IN ('candlestick', 'line', 'bar', 'area', 'ohlc')
++    ),
++    CONSTRAINT user_preferences_refresh_interval_check CHECK (data_refresh_interval >= 5),
++    CONSTRAINT user_preferences_alert_threshold_check CHECK (alert_threshold >= 0 AND alert_threshold <= 100),
++    CONSTRAINT user_preferences_order_type_check CHECK (
++        default_order_type IN ('market', 'limit', 'stop', 'stop_limit')
++    )
++);
++
++CREATE INDEX idx_user_preferences_user_id ON user_preferences(user_id);
++CREATE INDEX idx_user_preferences_theme ON user_preferences(theme);
++CREATE INDEX idx_user_preferences_language ON user_preferences(language);
++
++COMMENT ON TABLE user_preferences IS 'Comprehensive user configuration settings';
++COMMENT ON COLUMN user_preferences.theme IS 'UI theme: light, dark, system';
++COMMENT ON COLUMN user_preferences.data_refresh_interval IS 'Data refresh interval in seconds';
++COMMENT ON COLUMN user_preferences.alert_threshold IS 'Default alert threshold percentage';
++COMMENT ON COLUMN user_preferences.api_access_enabled IS 'Whether user has API access enabled';
++
++
++CREATE TABLE user_theme_preferences (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
++    
++    theme_mode VARCHAR(20) DEFAULT 'system',
++    color_scheme VARCHAR(50) DEFAULT 'default',
++    primary_color VARCHAR(7) DEFAULT '#3B82F6',
++    accent_color VARCHAR(7) DEFAULT '#10B981',
++    
++    font_family VARCHAR(100) DEFAULT 'Inter',
++    font_size VARCHAR(20) DEFAULT 'medium',
++    
++    chart_theme VARCHAR(50) DEFAULT 'default',
++    sidebar_position VARCHAR(20) DEFAULT 'left',
++    compact_mode BOOLEAN DEFAULT FALSE,
++    animations_enabled BOOLEAN DEFAULT TRUE,
++    border_radius VARCHAR(20) DEFAULT 'medium',
++    
++    custom_css TEXT,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT user_theme_preferences_mode_check CHECK (theme_mode IN ('light', 'dark', 'system')),
++    CONSTRAINT user_theme_preferences_font_size_check CHECK (
++        font_size IN ('small', 'medium', 'large', 'extra_large')
++    ),
++    CONSTRAINT user_theme_preferences_sidebar_check CHECK (sidebar_position IN ('left', 'right')),
++    CONSTRAINT user_theme_preferences_border_radius_check CHECK (
++        border_radius IN ('none', 'small', 'medium', 'large', 'full')
++    ),
++    CONSTRAINT user_theme_preferences_color_format_check CHECK (
++        primary_color ~ '^#[0-9A-Fa-f]{6}$' AND accent_color ~ '^#[0-9A-Fa-f]{6}$'
++    )
++);
++
++CREATE INDEX idx_user_theme_preferences_user_id ON user_theme_preferences(user_id);
++CREATE INDEX idx_user_theme_preferences_theme_mode ON user_theme_preferences(theme_mode);
++
++COMMENT ON TABLE user_theme_preferences IS 'Detailed UI theme customization settings';
++COMMENT ON COLUMN user_theme_preferences.primary_color IS 'Primary brand color (hex format: #RRGGBB)';
++COMMENT ON COLUMN user_theme_preferences.accent_color IS 'Accent color (hex format: #RRGGBB)';
++COMMENT ON COLUMN user_theme_preferences.custom_css IS 'User-provided custom CSS for advanced styling';
++
++
++CREATE TRIGGER update_user_preferences_updated_at
++    BEFORE UPDATE ON user_preferences
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_user_theme_preferences_updated_at
++    BEFORE UPDATE ON user_theme_preferences
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From 96a5035d9bd08aa4ce8a87e27b3430d366291d54 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:58 +0000
+Subject: [PATCH 07/11] feat: Add PostgreSQL onboarding schema with progress
+ tracking and trading preferences
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/07_onboarding.sql | 190 ++++++++++++++++++++++
+ 1 file changed, 190 insertions(+)
+ create mode 100644 server/database/schemas/07_onboarding.sql
+
+diff --git a/server/database/schemas/07_onboarding.sql b/server/database/schemas/07_onboarding.sql
+new file mode 100644
+index 0000000..b44b1bf
+--- /dev/null
++++ b/server/database/schemas/07_onboarding.sql
+@@ -0,0 +1,190 @@
++
++
++CREATE TABLE user_onboarding_progress (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
++    
++    current_step INTEGER NOT NULL DEFAULT 1,
++    completed_steps JSONB NOT NULL DEFAULT '[]'::jsonb,
++    is_complete BOOLEAN NOT NULL DEFAULT FALSE,
++    completion_percentage DECIMAL(5, 2) NOT NULL DEFAULT 0.00,
++    
++    welcome_viewed BOOLEAN NOT NULL DEFAULT FALSE,
++    welcome_viewed_at TIMESTAMPTZ,
++    
++    trading_experience VARCHAR(50),
++    risk_tolerance VARCHAR(50),
++    investment_horizon VARCHAR(50),
++    initial_investment DECIMAL(20, 2),
++    trading_frequency VARCHAR(50),
++    preferred_markets JSONB DEFAULT '[]'::jsonb,
++    
++    full_name VARCHAR(255),
++    first_name VARCHAR(100),
++    last_name VARCHAR(100),
++    phone_number VARCHAR(30),
++    preferred_currency VARCHAR(10) DEFAULT 'NZD',
++    date_of_birth DATE,
++    
++    tax_residency VARCHAR(100),
++    secondary_tax_residency VARCHAR(100),
++    tax_identification_number VARCHAR(100),
++    tax_file_number VARCHAR(100),
++    employment_status VARCHAR(50),
++    tax_year_preference VARCHAR(20) DEFAULT 'calendar',
++    tax_registered_business BOOLEAN DEFAULT FALSE,
++    
++    help_level VARCHAR(20) DEFAULT 'guided',
++    notification_preferences JSONB DEFAULT '{"email": true, "push": true, "sms": false}'::jsonb,
++    privacy_settings JSONB DEFAULT '{"profilePublic": false, "performancePublic": false}'::jsonb,
++    
++    connect_brokers BOOLEAN DEFAULT FALSE,
++    selected_brokers JSONB DEFAULT '[]'::jsonb,
++    has_existing_portfolio BOOLEAN DEFAULT FALSE,
++    existing_portfolio_value DECIMAL(20, 2),
++    
++    terms_accepted BOOLEAN DEFAULT FALSE,
++    terms_accepted_at TIMESTAMPTZ,
++    privacy_policy_accepted BOOLEAN DEFAULT FALSE,
++    privacy_policy_accepted_at TIMESTAMPTZ,
++    
++    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    completed_at TIMESTAMPTZ,
++    last_active_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT onboarding_progress_step_positive CHECK (current_step > 0),
++    CONSTRAINT onboarding_progress_completion_range CHECK (
++        completion_percentage >= 0 AND completion_percentage <= 100
++    ),
++    CONSTRAINT onboarding_progress_trading_exp_check CHECK (
++        trading_experience IS NULL OR trading_experience IN (
++            'none', 'beginner', 'intermediate', 'advanced', 'professional'
++        )
++    ),
++    CONSTRAINT onboarding_progress_risk_tolerance_check CHECK (
++        risk_tolerance IS NULL OR risk_tolerance IN (
++            'very_low', 'low', 'moderate', 'high', 'very_high'
++        )
++    ),
++    CONSTRAINT onboarding_progress_investment_horizon_check CHECK (
++        investment_horizon IS NULL OR investment_horizon IN (
++            'short_term', 'medium_term', 'long_term'
++        )
++    ),
++    CONSTRAINT onboarding_progress_help_level_check CHECK (
++        help_level IN ('guided', 'minimal', 'none')
++    ),
++    CONSTRAINT onboarding_progress_tax_year_check CHECK (
++        tax_year_preference IN ('calendar', 'financial')
++    )
++);
++
++CREATE INDEX idx_onboarding_progress_user_id ON user_onboarding_progress(user_id);
++CREATE INDEX idx_onboarding_progress_complete ON user_onboarding_progress(is_complete);
++CREATE INDEX idx_onboarding_progress_started_at ON user_onboarding_progress(started_at DESC);
++CREATE INDEX idx_onboarding_progress_completed_at ON user_onboarding_progress(completed_at DESC);
++
++COMMENT ON TABLE user_onboarding_progress IS 'User onboarding progress tracking and collected information';
++COMMENT ON COLUMN user_onboarding_progress.current_step IS 'Current onboarding step number';
++COMMENT ON COLUMN user_onboarding_progress.completed_steps IS 'Array of completed step numbers';
++COMMENT ON COLUMN user_onboarding_progress.trading_experience IS 'Self-reported trading experience level';
++COMMENT ON COLUMN user_onboarding_progress.risk_tolerance IS 'Self-reported risk tolerance level';
++COMMENT ON COLUMN user_onboarding_progress.help_level IS 'Preferred UI guidance level';
++
++
++CREATE TABLE user_trading_preferences (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
++    
++    trading_style VARCHAR(50) DEFAULT 'balanced',
++    strategy_preference VARCHAR(50) DEFAULT 'mixed',
++    
++    position_sizing_method VARCHAR(50) DEFAULT 'percentage',
++    default_position_size DECIMAL(10, 4) DEFAULT 5.0,
++    max_position_size DECIMAL(10, 4) DEFAULT 20.0,
++    
++    stop_loss_percentage DECIMAL(10, 4) DEFAULT 10.0,
++    take_profit_percentage DECIMAL(10, 4) DEFAULT 20.0,
++    max_daily_trades INTEGER DEFAULT 10,
++    max_weekly_trades INTEGER DEFAULT 50,
++    
++    cash_allocation_target DECIMAL(10, 4) DEFAULT 10.0,
++    equity_allocation_target DECIMAL(10, 4) DEFAULT 70.0,
++    bond_allocation_target DECIMAL(10, 4) DEFAULT 15.0,
++    alternative_allocation_target DECIMAL(10, 4) DEFAULT 5.0,
++    
++    auto_rebalance_enabled BOOLEAN DEFAULT TRUE,
++    rebalance_threshold DECIMAL(10, 4) DEFAULT 5.0,
++    rebalance_frequency VARCHAR(20) DEFAULT 'monthly',
++    
++    base_currency VARCHAR(10) DEFAULT 'NZD',
++    currency_hedging_preference VARCHAR(20) DEFAULT 'auto',
++    tax_loss_harvesting_enabled BOOLEAN DEFAULT TRUE,
++    franking_credits_consideration BOOLEAN DEFAULT TRUE,
++    nz_tax_optimization BOOLEAN DEFAULT TRUE,
++    
++    price_alert_threshold DECIMAL(10, 4) DEFAULT 5.0,
++    portfolio_alert_threshold DECIMAL(10, 4) DEFAULT 10.0,
++    news_alert_enabled BOOLEAN DEFAULT TRUE,
++    signal_alert_enabled BOOLEAN DEFAULT TRUE,
++    
++    auto_save_enabled BOOLEAN DEFAULT TRUE,
++    advanced_mode_enabled BOOLEAN DEFAULT FALSE,
++    paper_trading_enabled BOOLEAN DEFAULT TRUE,
++    real_trading_enabled BOOLEAN DEFAULT FALSE,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT trading_prefs_trading_style_check CHECK (
++        trading_style IN ('conservative', 'balanced', 'aggressive', 'custom')
++    ),
++    CONSTRAINT trading_prefs_strategy_check CHECK (
++        strategy_preference IN ('value', 'growth', 'dividend', 'momentum', 'mixed')
++    ),
++    CONSTRAINT trading_prefs_position_sizing_check CHECK (
++        position_sizing_method IN ('fixed_amount', 'percentage', 'risk_based', 'kelly')
++    ),
++    CONSTRAINT trading_prefs_position_size_range CHECK (
++        default_position_size > 0 AND default_position_size <= max_position_size
++    ),
++    CONSTRAINT trading_prefs_stop_loss_range CHECK (
++        stop_loss_percentage > 0 AND stop_loss_percentage <= 100
++    ),
++    CONSTRAINT trading_prefs_take_profit_range CHECK (
++        take_profit_percentage > 0 AND take_profit_percentage <= 1000
++    ),
++    CONSTRAINT trading_prefs_allocation_total CHECK (
++        cash_allocation_target + equity_allocation_target + 
++        bond_allocation_target + alternative_allocation_target = 100.0
++    ),
++    CONSTRAINT trading_prefs_rebalance_freq_check CHECK (
++        rebalance_frequency IN ('daily', 'weekly', 'monthly', 'quarterly', 'annually')
++    ),
++    CONSTRAINT trading_prefs_currency_hedging_check CHECK (
++        currency_hedging_preference IN ('none', 'partial', 'full', 'auto')
++    )
++);
++
++CREATE INDEX idx_trading_preferences_user_id ON user_trading_preferences(user_id);
++CREATE INDEX idx_trading_preferences_trading_style ON user_trading_preferences(trading_style);
++CREATE INDEX idx_trading_preferences_paper_trading ON user_trading_preferences(paper_trading_enabled);
++
++COMMENT ON TABLE user_trading_preferences IS 'User trading style and default parameters';
++COMMENT ON COLUMN user_trading_preferences.trading_style IS 'Overall trading approach: conservative, balanced, aggressive, custom';
++COMMENT ON COLUMN user_trading_preferences.position_sizing_method IS 'Method for calculating position sizes';
++COMMENT ON COLUMN user_trading_preferences.paper_trading_enabled IS 'Whether paper trading (simulation) is enabled';
++COMMENT ON COLUMN user_trading_preferences.real_trading_enabled IS 'Whether real trading is enabled';
++
++
++CREATE TRIGGER update_onboarding_progress_updated_at
++    BEFORE UPDATE ON user_onboarding_progress
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_trading_preferences_updated_at
++    BEFORE UPDATE ON user_trading_preferences
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From 3a593bed96ff85976aee3b5e3e57c6849683981f Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:59 +0000
+Subject: [PATCH 08/11] feat: Add PostgreSQL journaling schema with entries,
+ trade logs, and analysis
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/08_journaling.sql | 226 ++++++++++++++++++++++
+ 1 file changed, 226 insertions(+)
+ create mode 100644 server/database/schemas/08_journaling.sql
+
+diff --git a/server/database/schemas/08_journaling.sql b/server/database/schemas/08_journaling.sql
+new file mode 100644
+index 0000000..7ebdf09
+--- /dev/null
++++ b/server/database/schemas/08_journaling.sql
+@@ -0,0 +1,226 @@
++
++
++CREATE TABLE journal_entries (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    title VARCHAR(500),
++    content TEXT NOT NULL,
++    entry_type VARCHAR(20) DEFAULT 'general',
++    
++    trade_id UUID,
++    asset_symbol VARCHAR(20),
++    trade_type VARCHAR(10),
++    
++    entry_price DECIMAL(20, 4),
++    exit_price DECIMAL(20, 4),
++    quantity DECIMAL(20, 8),
++    strategy_used VARCHAR(100),
++    reasoning TEXT,
++    market_conditions TEXT,
++    
++    confidence_level INTEGER DEFAULT 5,
++    expected_outcome TEXT,
++    actual_outcome TEXT,
++    success_rating INTEGER,
++    lessons_learned TEXT,
++    
++    tags JSONB DEFAULT '[]'::jsonb,
++    mood VARCHAR(50),
++    market_phase VARCHAR(50),
++    is_public BOOLEAN DEFAULT FALSE,
++    
++    entry_date DATE NOT NULL,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT journal_entries_entry_type_check CHECK (
++        entry_type IN ('general', 'trade', 'analysis', 'reflection', 'lesson')
++    ),
++    CONSTRAINT journal_entries_trade_type_check CHECK (
++        trade_type IS NULL OR trade_type IN ('buy', 'sell', 'short', 'cover')
++    ),
++    CONSTRAINT journal_entries_confidence_range CHECK (
++        confidence_level >= 1 AND confidence_level <= 10
++    ),
++    CONSTRAINT journal_entries_success_rating_range CHECK (
++        success_rating IS NULL OR (success_rating >= 1 AND success_rating <= 10)
++    ),
++    CONSTRAINT journal_entries_content_not_empty CHECK (LENGTH(TRIM(content)) > 0)
++);
++
++CREATE INDEX idx_journal_entries_user_id ON journal_entries(user_id);
++CREATE INDEX idx_journal_entries_trade_id ON journal_entries(trade_id);
++CREATE INDEX idx_journal_entries_entry_type ON journal_entries(entry_type);
++CREATE INDEX idx_journal_entries_asset_symbol ON journal_entries(asset_symbol);
++CREATE INDEX idx_journal_entries_entry_date ON journal_entries(entry_date DESC);
++CREATE INDEX idx_journal_entries_created_at ON journal_entries(created_at DESC);
++CREATE INDEX idx_journal_entries_is_public ON journal_entries(is_public) WHERE is_public = TRUE;
++CREATE INDEX idx_journal_entries_tags ON journal_entries USING GIN(tags);
++
++COMMENT ON TABLE journal_entries IS 'Trade journal entries and reflection notes';
++COMMENT ON COLUMN journal_entries.entry_type IS 'Type of entry: general, trade, analysis, reflection, lesson';
++COMMENT ON COLUMN journal_entries.confidence_level IS 'Confidence level when making trade decision (1-10)';
++COMMENT ON COLUMN journal_entries.success_rating IS 'Post-trade success rating (1-10)';
++COMMENT ON COLUMN journal_entries.tags IS 'User-defined tags for categorization';
++
++
++CREATE TABLE manual_trade_logs (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    journal_entry_id UUID REFERENCES journal_entries(id) ON DELETE SET NULL,
++    
++    symbol VARCHAR(20) NOT NULL,
++    asset_name VARCHAR(255),
++    
++    trade_type VARCHAR(10) NOT NULL,
++    entry_price DECIMAL(20, 4) NOT NULL,
++    quantity DECIMAL(20, 8) NOT NULL,
++    total_value DECIMAL(20, 2) NOT NULL,
++    order_type VARCHAR(20) DEFAULT 'market',
++    fees DECIMAL(20, 2) DEFAULT 0.00,
++    broker VARCHAR(100),
++    account_type VARCHAR(20) DEFAULT 'real',
++    
++    target_price DECIMAL(20, 4),
++    stop_loss_price DECIMAL(20, 4),
++    risk_reward_ratio DECIMAL(10, 2),
++    position_size_percent DECIMAL(10, 4),
++    
++    strategy VARCHAR(100),
++    time_horizon VARCHAR(20) DEFAULT 'medium',
++    conviction_level INTEGER DEFAULT 5,
++    
++    market_conditions TEXT,
++    economic_events JSONB DEFAULT '[]'::jsonb,
++    technical_indicators JSONB DEFAULT '{}'::jsonb,
++    
++    current_price DECIMAL(20, 4),
++    unrealized_pnl DECIMAL(20, 2) DEFAULT 0.00,
++    unrealized_pnl_percent DECIMAL(10, 4) DEFAULT 0.0000,
++    max_profit DECIMAL(20, 2) DEFAULT 0.00,
++    max_loss DECIMAL(20, 2) DEFAULT 0.00,
++    
++    exit_price DECIMAL(20, 4),
++    exit_date TIMESTAMPTZ,
++    exit_reason TEXT,
++    realized_pnl DECIMAL(20, 2),
++    realized_pnl_percent DECIMAL(10, 4),
++    
++    status VARCHAR(20) DEFAULT 'open',
++    is_active BOOLEAN DEFAULT TRUE,
++    
++    trade_date DATE NOT NULL,
++    execution_time TIMESTAMPTZ NOT NULL,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT manual_trade_logs_trade_type_check CHECK (
++        trade_type IN ('buy', 'sell', 'short', 'cover')
++    ),
++    CONSTRAINT manual_trade_logs_order_type_check CHECK (
++        order_type IN ('market', 'limit', 'stop', 'stop_limit')
++    ),
++    CONSTRAINT manual_trade_logs_account_type_check CHECK (
++        account_type IN ('real', 'paper', 'demo')
++    ),
++    CONSTRAINT manual_trade_logs_time_horizon_check CHECK (
++        time_horizon IN ('intraday', 'short', 'medium', 'long')
++    ),
++    CONSTRAINT manual_trade_logs_conviction_range CHECK (
++        conviction_level >= 1 AND conviction_level <= 10
++    ),
++    CONSTRAINT manual_trade_logs_status_check CHECK (
++        status IN ('open', 'closed', 'partial', 'cancelled')
++    ),
++    CONSTRAINT manual_trade_logs_quantity_positive CHECK (quantity > 0),
++    CONSTRAINT manual_trade_logs_entry_price_positive CHECK (entry_price > 0)
++);
++
++CREATE INDEX idx_manual_trade_logs_user_id ON manual_trade_logs(user_id);
++CREATE INDEX idx_manual_trade_logs_journal_entry_id ON manual_trade_logs(journal_entry_id);
++CREATE INDEX idx_manual_trade_logs_symbol ON manual_trade_logs(symbol);
++CREATE INDEX idx_manual_trade_logs_status ON manual_trade_logs(status);
++CREATE INDEX idx_manual_trade_logs_trade_date ON manual_trade_logs(trade_date DESC);
++CREATE INDEX idx_manual_trade_logs_execution_time ON manual_trade_logs(execution_time DESC);
++CREATE INDEX idx_manual_trade_logs_user_symbol ON manual_trade_logs(user_id, symbol);
++CREATE INDEX idx_manual_trade_logs_user_status ON manual_trade_logs(user_id, status);
++
++COMMENT ON TABLE manual_trade_logs IS 'Detailed manual trade execution records';
++COMMENT ON COLUMN manual_trade_logs.trade_type IS 'Trade action: buy, sell, short, cover';
++COMMENT ON COLUMN manual_trade_logs.conviction_level IS 'Trader conviction level (1-10)';
++COMMENT ON COLUMN manual_trade_logs.risk_reward_ratio IS 'Expected risk/reward ratio';
++COMMENT ON COLUMN manual_trade_logs.status IS 'Trade status: open, closed, partial, cancelled';
++
++
++CREATE TABLE trade_analysis (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    trade_log_id UUID NOT NULL UNIQUE REFERENCES manual_trade_logs(id) ON DELETE CASCADE,
++    
++    pre_trade_analysis TEXT,
++    entry_criteria TEXT,
++    risk_assessment TEXT,
++    expected_duration TEXT,
++    
++    mid_trade_notes JSONB DEFAULT '[]'::jsonb,
++    adjustment_reasons JSONB DEFAULT '[]'::jsonb,
++    emotional_state JSONB DEFAULT '[]'::jsonb,
++    
++    post_trade_analysis TEXT,
++    what_went_right TEXT,
++    what_went_wrong TEXT,
++    key_learnings TEXT,
++    would_do_differently TEXT,
++    
++    execution_quality INTEGER DEFAULT 5,
++    timing_quality INTEGER DEFAULT 5,
++    risk_management_quality INTEGER DEFAULT 5,
++    
++    pre_trade_emotion VARCHAR(50),
++    during_trade_emotion VARCHAR(50),
++    post_trade_emotion VARCHAR(50),
++    emotional_discipline_rating INTEGER DEFAULT 5,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT trade_analysis_execution_quality_range CHECK (
++        execution_quality >= 1 AND execution_quality <= 10
++    ),
++    CONSTRAINT trade_analysis_timing_quality_range CHECK (
++        timing_quality >= 1 AND timing_quality <= 10
++    ),
++    CONSTRAINT trade_analysis_risk_quality_range CHECK (
++        risk_management_quality >= 1 AND risk_management_quality <= 10
++    ),
++    CONSTRAINT trade_analysis_emotional_discipline_range CHECK (
++        emotional_discipline_rating >= 1 AND emotional_discipline_rating <= 10
++    )
++);
++
++CREATE INDEX idx_trade_analysis_user_id ON trade_analysis(user_id);
++CREATE INDEX idx_trade_analysis_trade_log_id ON trade_analysis(trade_log_id);
++CREATE INDEX idx_trade_analysis_created_at ON trade_analysis(created_at DESC);
++
++COMMENT ON TABLE trade_analysis IS 'Detailed post-trade analysis and reflection';
++COMMENT ON COLUMN trade_analysis.execution_quality IS 'Quality of trade execution (1-10)';
++COMMENT ON COLUMN trade_analysis.timing_quality IS 'Quality of entry/exit timing (1-10)';
++COMMENT ON COLUMN trade_analysis.risk_management_quality IS 'Quality of risk management (1-10)';
++COMMENT ON COLUMN trade_analysis.emotional_discipline_rating IS 'Emotional discipline rating (1-10)';
++
++
++CREATE TRIGGER update_journal_entries_updated_at
++    BEFORE UPDATE ON journal_entries
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_manual_trade_logs_updated_at
++    BEFORE UPDATE ON manual_trade_logs
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_trade_analysis_updated_at
++    BEFORE UPDATE ON trade_analysis
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From 643e213180dc9c3b911520e6cccea205b6dcb85c Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:33:59 +0000
+Subject: [PATCH 09/11] feat: Add PostgreSQL vault categories schema with
+ allocation and assignment management
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ .../database/schemas/09_vault_categories.sql  | 138 ++++++++++++++++++
+ 1 file changed, 138 insertions(+)
+ create mode 100644 server/database/schemas/09_vault_categories.sql
+
+diff --git a/server/database/schemas/09_vault_categories.sql b/server/database/schemas/09_vault_categories.sql
+new file mode 100644
+index 0000000..5c05a48
+--- /dev/null
++++ b/server/database/schemas/09_vault_categories.sql
+@@ -0,0 +1,138 @@
++
++
++CREATE TABLE vault_categories (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    category_name VARCHAR(255) NOT NULL,
++    category_code VARCHAR(50) NOT NULL,
++    category_type VARCHAR(50) NOT NULL,
++    category_description TEXT,
++    category_color VARCHAR(7) DEFAULT '#3B82F6',
++    category_icon VARCHAR(100),
++    
++    target_allocation_percent DECIMAL(10, 4) DEFAULT 0.0000,
++    min_allocation_percent DECIMAL(10, 4) DEFAULT 0.0000,
++    max_allocation_percent DECIMAL(10, 4) DEFAULT 100.0000,
++    
++    rebalance_threshold DECIMAL(10, 4) DEFAULT 5.0000,
++    rebalance_frequency VARCHAR(20) DEFAULT 'monthly',
++    auto_rebalance_enabled BOOLEAN DEFAULT TRUE,
++    
++    risk_level VARCHAR(20) DEFAULT 'medium',
++    max_single_position_percent DECIMAL(10, 4) DEFAULT 10.0000,
++    volatility_limit DECIMAL(10, 4) DEFAULT 25.0000,
++    
++    tax_efficiency_priority INTEGER DEFAULT 5,
++    tax_loss_harvesting_enabled BOOLEAN DEFAULT TRUE,
++    
++    is_active BOOLEAN DEFAULT TRUE,
++    display_order INTEGER DEFAULT 1,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT vault_categories_unique_user_code UNIQUE(user_id, category_code),
++    CONSTRAINT vault_categories_type_check CHECK (
++        category_type IN ('asset_class', 'sector', 'geography', 'strategy', 'risk_level', 'custom')
++    ),
++    CONSTRAINT vault_categories_allocation_range CHECK (
++        target_allocation_percent >= 0 AND target_allocation_percent <= 100 AND
++        min_allocation_percent >= 0 AND min_allocation_percent <= 100 AND
++        max_allocation_percent >= 0 AND max_allocation_percent <= 100 AND
++        min_allocation_percent <= target_allocation_percent AND
++        target_allocation_percent <= max_allocation_percent
++    ),
++    CONSTRAINT vault_categories_rebalance_threshold_check CHECK (
++        rebalance_threshold >= 0 AND rebalance_threshold <= 100
++    ),
++    CONSTRAINT vault_categories_rebalance_frequency_check CHECK (
++        rebalance_frequency IN ('daily', 'weekly', 'monthly', 'quarterly', 'annually', 'never')
++    ),
++    CONSTRAINT vault_categories_risk_level_check CHECK (
++        risk_level IN ('very_low', 'low', 'medium', 'high', 'very_high')
++    ),
++    CONSTRAINT vault_categories_position_percent_check CHECK (
++        max_single_position_percent > 0 AND max_single_position_percent <= 100
++    ),
++    CONSTRAINT vault_categories_volatility_check CHECK (
++        volatility_limit > 0 AND volatility_limit <= 100
++    ),
++    CONSTRAINT vault_categories_tax_priority_range CHECK (
++        tax_efficiency_priority >= 1 AND tax_efficiency_priority <= 10
++    ),
++    CONSTRAINT vault_categories_display_order_positive CHECK (display_order > 0),
++    CONSTRAINT vault_categories_color_format_check CHECK (
++        category_color ~ '^#[0-9A-Fa-f]{6}$'
++    )
++);
++
++CREATE INDEX idx_vault_categories_user_id ON vault_categories(user_id);
++CREATE INDEX idx_vault_categories_category_type ON vault_categories(category_type);
++CREATE INDEX idx_vault_categories_is_active ON vault_categories(is_active) WHERE is_active = TRUE;
++CREATE INDEX idx_vault_categories_user_active ON vault_categories(user_id, is_active);
++CREATE INDEX idx_vault_categories_display_order ON vault_categories(user_id, display_order);
++
++COMMENT ON TABLE vault_categories IS 'User-defined asset allocation categories';
++COMMENT ON COLUMN vault_categories.category_type IS 'Category classification: asset_class, sector, geography, strategy, risk_level, custom';
++COMMENT ON COLUMN vault_categories.target_allocation_percent IS 'Target allocation percentage for this category (0-100)';
++COMMENT ON COLUMN vault_categories.rebalance_threshold IS 'Drift % that triggers rebalancing';
++COMMENT ON COLUMN vault_categories.risk_level IS 'Risk classification: very_low, low, medium, high, very_high';
++COMMENT ON COLUMN vault_categories.tax_efficiency_priority IS 'Tax efficiency priority (1-10, higher = more important)';
++
++
++CREATE TABLE asset_category_assignment (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    category_id UUID NOT NULL REFERENCES vault_categories(id) ON DELETE CASCADE,
++    
++    symbol VARCHAR(20) NOT NULL,
++    asset_name VARCHAR(255),
++    asset_class VARCHAR(50),
++    sector VARCHAR(100),
++    market VARCHAR(50) DEFAULT 'NZX',
++    
++    assignment_type VARCHAR(20) DEFAULT 'manual',
++    assignment_rule TEXT,
++    assignment_confidence DECIMAL(5, 4) DEFAULT 1.0000,
++    
++    target_weight_in_category DECIMAL(10, 4) DEFAULT 0.0000,
++    
++    is_active BOOLEAN DEFAULT TRUE,
++    
++    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    
++    CONSTRAINT asset_category_assignment_assignment_type_check CHECK (
++        assignment_type IN ('manual', 'auto', 'rule_based', 'ai_suggested')
++    ),
++    CONSTRAINT asset_category_assignment_confidence_range CHECK (
++        assignment_confidence >= 0 AND assignment_confidence <= 1
++    ),
++    CONSTRAINT asset_category_assignment_weight_range CHECK (
++        target_weight_in_category >= 0 AND target_weight_in_category <= 100
++    )
++);
++
++CREATE INDEX idx_asset_category_assignment_user_id ON asset_category_assignment(user_id);
++CREATE INDEX idx_asset_category_assignment_category_id ON asset_category_assignment(category_id);
++CREATE INDEX idx_asset_category_assignment_symbol ON asset_category_assignment(symbol);
++CREATE INDEX idx_asset_category_assignment_is_active ON asset_category_assignment(is_active) WHERE is_active = TRUE;
++CREATE INDEX idx_asset_category_assignment_user_symbol ON asset_category_assignment(user_id, symbol);
++CREATE INDEX idx_asset_category_assignment_user_category ON asset_category_assignment(user_id, category_id);
++
++COMMENT ON TABLE asset_category_assignment IS 'Maps individual assets to vault categories';
++COMMENT ON COLUMN asset_category_assignment.assignment_type IS 'How asset was assigned: manual, auto, rule_based, ai_suggested';
++COMMENT ON COLUMN asset_category_assignment.assignment_confidence IS 'Confidence in assignment (0-1, used for auto assignments)';
++COMMENT ON COLUMN asset_category_assignment.target_weight_in_category IS 'Target weight within the category (0-100%)';
++
++
++CREATE TRIGGER update_vault_categories_updated_at
++    BEFORE UPDATE ON vault_categories
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
++
++CREATE TRIGGER update_asset_category_assignment_updated_at
++    BEFORE UPDATE ON asset_category_assignment
++    FOR EACH ROW
++    EXECUTE FUNCTION update_updated_at_column();
+-- 
+2.34.1
+
+
+From a89b5040c7daa850cc4f391975922158ed8ecd44 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:34:00 +0000
+Subject: [PATCH 10/11] feat: Add PostgreSQL universal logging schema with
+ agent memory and activity views
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/10_logging.sql | 83 ++++++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+ create mode 100644 server/database/schemas/10_logging.sql
+
+diff --git a/server/database/schemas/10_logging.sql b/server/database/schemas/10_logging.sql
+new file mode 100644
+index 0000000..b5b0033
+--- /dev/null
++++ b/server/database/schemas/10_logging.sql
+@@ -0,0 +1,83 @@
++
++
++CREATE TABLE agent_memory (
++    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    
++    block_id VARCHAR(50) NOT NULL,
++    action VARCHAR(100) NOT NULL,
++    context TEXT NOT NULL,
++    
++    user_input TEXT,
++    agent_response TEXT,
++    
++    metadata JSONB,
++    
++    timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    session_id VARCHAR(255) NOT NULL
++);
++
++CREATE INDEX idx_agent_memory_user_id ON agent_memory(user_id);
++CREATE INDEX idx_agent_memory_timestamp ON agent_memory(timestamp DESC);
++CREATE INDEX idx_agent_memory_user_timestamp ON agent_memory(user_id, timestamp DESC);
++CREATE INDEX idx_agent_memory_block_id ON agent_memory(block_id);
++CREATE INDEX idx_agent_memory_action ON agent_memory(action);
++CREATE INDEX idx_agent_memory_session_id ON agent_memory(session_id);
++CREATE INDEX idx_agent_memory_metadata ON agent_memory USING GIN(metadata);
++
++COMMENT ON TABLE agent_memory IS 'Universal logging of all user actions for AI learning and analytics';
++COMMENT ON COLUMN agent_memory.block_id IS 'Feature/module identifier (e.g., "block_1", "block_13")';
++COMMENT ON COLUMN agent_memory.action IS 'Action type performed';
++COMMENT ON COLUMN agent_memory.context IS 'Action summary/description';
++COMMENT ON COLUMN agent_memory.user_input IS 'User input data (JSON or text)';
++COMMENT ON COLUMN agent_memory.agent_response IS 'System response data (JSON or text)';
++COMMENT ON COLUMN agent_memory.metadata IS 'Additional contextual information in JSON format';
++COMMENT ON COLUMN agent_memory.session_id IS 'User session identifier for grouping related actions';
++
++
++
++
++
++CREATE OR REPLACE FUNCTION archive_old_agent_memory()
++RETURNS void AS $$
++BEGIN
++    
++    
++    RAISE NOTICE 'Agent memory archival completed at %', NOW();
++END;
++$$ LANGUAGE plpgsql;
++
++
++
++CREATE OR REPLACE VIEW agent_memory_statistics AS
++SELECT 
++    user_id,
++    DATE(timestamp) as activity_date,
++    block_id,
++    action,
++    COUNT(*) as action_count,
++    COUNT(DISTINCT session_id) as session_count,
++    MIN(timestamp) as first_action_time,
++    MAX(timestamp) as last_action_time
++FROM agent_memory
++GROUP BY user_id, DATE(timestamp), block_id, action;
++
++COMMENT ON VIEW agent_memory_statistics IS 'Daily aggregated user activity statistics';
++
++
++CREATE OR REPLACE VIEW recent_agent_activity AS
++SELECT 
++    am.id,
++    am.user_id,
++    u.email as user_email,
++    am.block_id,
++    am.action,
++    am.context,
++    am.timestamp,
++    am.session_id
++FROM agent_memory am
++JOIN users u ON am.user_id = u.id
++WHERE am.timestamp >= NOW() - INTERVAL '24 hours'
++ORDER BY am.timestamp DESC;
++
++COMMENT ON VIEW recent_agent_activity IS 'User activity from the last 24 hours';
+-- 
+2.34.1
+
+
+From be07f6f73c84cb77549411c1583b761aed752dfc Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:35:33 +0000
+Subject: [PATCH 11/11] docs: Add comprehensive PostgreSQL schema documentation
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database/schemas/README.md | 369 ++++++++++++++++++++++++++++++
+ 1 file changed, 369 insertions(+)
+ create mode 100644 server/database/schemas/README.md
+
+diff --git a/server/database/schemas/README.md b/server/database/schemas/README.md
+new file mode 100644
+index 0000000..e128626
+--- /dev/null
++++ b/server/database/schemas/README.md
+@@ -0,0 +1,369 @@
++# StackMotive PostgreSQL Database Schema
++
++## Overview
++
++This directory contains the complete PostgreSQL schema for the StackMotive retail investor protection platform. The schema has been designed based on comprehensive data requirements analysis covering 22 persistent tables with 400+ fields.
++
++## Schema Organization
++
++The schema is divided into 10 logical modules, each in a separate SQL file:
++
++1. **01_authentication.sql** - User authentication and session management
++2. **02_portfolio.sql** - Portfolio summaries, holdings, and sync operations
++3. **03_trading.sql** - Trading automation rules (DCA, Stop-Loss)
++4. **04_rebalancing.sql** - Portfolio rebalancing schedules and execution history
++5. **05_watchlists.sql** - Asset watchlists with sharing capabilities
++6. **06_preferences.sql** - User configuration and theme preferences
++7. **07_onboarding.sql** - User onboarding progress and trading preferences
++8. **08_journaling.sql** - Trade journaling, logs, and analysis
++9. **09_vault_categories.sql** - Asset allocation categories and assignments
++10. **10_logging.sql** - Universal logging system (AgentMemory)
++
++## Schema Design Principles
++
++### Data Types
++- **Primary Keys**: UUID (not INTEGER) for distributed system compatibility
++- **Money/Decimals**: DECIMAL(20,2) or DECIMAL(10,4) for precision
++- **Timestamps**: TIMESTAMPTZ for timezone awareness
++- **JSON Data**: JSONB for efficient querying and indexing
++- **Enums**: CHECK constraints for type safety
++
++### Referential Integrity
++- All foreign keys defined with appropriate CASCADE rules
++- ON DELETE CASCADE for dependent data
++- ON DELETE SET NULL for optional relationships
++
++### Performance Optimization
++- Indexes on all foreign keys
++- Composite indexes for common query patterns
++- Partial indexes for filtered queries (e.g., WHERE is_active = TRUE)
++- GIN indexes for JSONB columns
++
++### Naming Conventions
++- Tables: snake_case, plural for collection tables
++- Columns: snake_case
++- Indexes: idx_{table}_{columns}
++- Constraints: {table}_{column}_{type}
++
++## Database Tables
++
++### Authentication & User Management (01_authentication.sql)
++```
++users (22 columns)
++├── Authentication: email, hashed_password
++├── Status: tier, is_active, is_admin
++├── Onboarding: has_completed_onboarding, onboarding_step
++└── Preferences: preferred_currency
++
++user_sessions (12 columns) - OPTIONAL for future use
++├── Session tracking: session_token, refresh_token
++├── Device info: ip_address, user_agent, device_info
++└── Lifecycle: expires_at, last_activity_at, is_active
++```
++
++### Portfolio Management (02_portfolio.sql)
++```
++portfolio_summary (12 columns)
++├── Identification: user_id, vault_id
++├── Metrics: portfolio_value, total_gain_loss, day_gain_loss
++└── Status: cash_balance, invested_amount, number_of_holdings
++
++portfolio_holdings (17 columns)
++├── Asset info: symbol, asset_name, asset_class
++├── Position: quantity, avg_cost, current_price, market_value
++└── Performance: total_gain_loss, day_gain_loss
++
++portfolio_position (13 columns)
++├── Detailed tracking with broker metadata
++└── Sync source: csv, ibkr, kucoin, kraken, tiger, manual
++
++portfolio_sync_log (10 columns)
++└── Audit trail of portfolio synchronization operations
++```
++
++### Trading Automation (03_trading.sql)
++```
++user_trade_rule (10 columns)
++├── DCA Rules: threshold, frequency, amount
++└── Stop-Loss Rules: threshold (stop percentage)
++```
++
++### Rebalancing (04_rebalancing.sql)
++```
++rebalance_schedule (15 columns)
++├── Schedule: frequency, threshold, day_of_week, time_of_day
++└── Constraints: max_trades_per_session, exclude_weekends
++
++rebalance_execution (8 columns)
++└── Execution history: type, portfolio_value, trades_executed, success
++```
++
++### Watchlists (05_watchlists.sql)
++```
++watchlists (6 columns)
++└── User-created watchlists with public/private visibility
++
++watchlist_items (8 columns)
++└── Assets in watchlists with cached market data
++
++watchlist_shares (6 columns)
++└── Sharing permissions between users
++```
++
++### User Preferences (06_preferences.sql)
++```
++user_preferences (30 columns)
++├── Display: theme, language, timezone, chart_type
++├── Data: data_refresh_interval, real_time_data
++├── Notifications: email, push, sms settings
++└── Trading: default_order_type, confirm_orders
++
++user_theme_preferences (13 columns)
++└── Detailed UI customization: colors, fonts, layout
++```
++
++### Onboarding (07_onboarding.sql)
++```
++user_onboarding_progress (38 columns)
++├── Progress: current_step, completed_steps, is_complete
++├── Profile: trading_experience, risk_tolerance, investment_horizon
++├── Personal: full_name, date_of_birth, phone_number
++├── Tax: tax_residency, tax_identification_number
++└── Legal: terms_accepted, privacy_policy_accepted
++
++user_trading_preferences (32 columns)
++├── Style: trading_style, strategy_preference
++├── Position Sizing: default_position_size, max_position_size
++├── Risk: stop_loss_percentage, take_profit_percentage
++├── Allocation: cash, equity, bond, alternative targets
++└── Trading Mode: paper_trading_enabled, real_trading_enabled
++```
++
++### Trade Journaling (08_journaling.sql)
++```
++journal_entries (22 columns)
++├── Entry details: title, content, entry_type
++├── Trade reference: trade_id, asset_symbol
++└── Analysis: confidence_level, success_rating, lessons_learned
++
++manual_trade_logs (38 columns)
++├── Execution: symbol, trade_type, entry_price, quantity
++├── Risk: target_price, stop_loss_price, risk_reward_ratio
++├── Strategy: strategy, time_horizon, conviction_level
++├── Position tracking: current_price, unrealized_pnl
++└── Exit: exit_price, exit_date, realized_pnl
++
++trade_analysis (20 columns)
++├── Pre-trade: pre_trade_analysis, entry_criteria, risk_assessment
++├── During: mid_trade_notes, adjustment_reasons, emotional_state
++├── Post-trade: what_went_right, what_went_wrong, key_learnings
++└── Quality: execution_quality, timing_quality, emotional_discipline
++```
++
++### Vault Categories (09_vault_categories.sql)
++```
++vault_categories (18 columns)
++├── Details: category_name, category_code, category_type
++├── Allocation: target, min, max allocation percentages
++├── Rebalancing: threshold, frequency, auto_rebalance_enabled
++├── Risk: risk_level, max_single_position_percent, volatility_limit
++└── Tax: tax_efficiency_priority, tax_loss_harvesting_enabled
++
++asset_category_assignment (12 columns)
++├── Asset: symbol, asset_name, asset_class, sector
++└── Assignment: assignment_type, confidence, target_weight
++```
++
++### Universal Logging (10_logging.sql)
++```
++agent_memory (9 columns)
++├── Context: block_id, action, context
++├── Data: user_input, agent_response, metadata (JSONB)
++└── Session: timestamp, session_id
++```
++
++## Installation Instructions
++
++### Prerequisites
++- PostgreSQL 14+ (for enhanced JSONB features)
++- UUID extension enabled
++
++### Deployment Steps
++
++1. **Create Database**
++```sql
++CREATE DATABASE stackmotive_production;
++\c stackmotive_production
++```
++
++2. **Execute Schema Files in Order**
++```bash
++psql -U postgres -d stackmotive_production -f 01_authentication.sql
++psql -U postgres -d stackmotive_production -f 02_portfolio.sql
++psql -U postgres -d stackmotive_production -f 03_trading.sql
++psql -U postgres -d stackmotive_production -f 04_rebalancing.sql
++psql -U postgres -d stackmotive_production -f 05_watchlists.sql
++psql -U postgres -d stackmotive_production -f 06_preferences.sql
++psql -U postgres -d stackmotive_production -f 07_onboarding.sql
++psql -U postgres -d stackmotive_production -f 08_journaling.sql
++psql -U postgres -d stackmotive_production -f 09_vault_categories.sql
++psql -U postgres -d stackmotive_production -f 10_logging.sql
++```
++
++3. **Create Application User and Grant Permissions**
++```sql
++CREATE USER stackmotive_app WITH PASSWORD 'your_secure_password';
++
++-- Grant table permissions
++GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO stackmotive_app;
++GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO stackmotive_app;
++
++-- Grant default permissions for future tables
++ALTER DEFAULT PRIVILEGES IN SCHEMA public 
++    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO stackmotive_app;
++ALTER DEFAULT PRIVILEGES IN SCHEMA public 
++    GRANT USAGE, SELECT ON SEQUENCES TO stackmotive_app;
++```
++
++## Data Relationships
++
++### Core Relationships
++```
++users (1) → (Many) portfolio_summary
++users (1) → (Many) portfolio_holdings
++users (1) → (Many) portfolio_position
++users (1) → (Many) user_trade_rule
++users (1) → (1) rebalance_schedule
++users (1) → (Many) watchlists
++users (1) → (1) user_preferences
++users (1) → (1) user_theme_preferences
++users (1) → (1) user_onboarding_progress
++users (1) → (1) user_trading_preferences
++users (1) → (Many) vault_categories
++users (1) → (Many) journal_entries
++users (1) → (Many) manual_trade_logs
++users (1) → (Many) agent_memory
++
++portfolio_summary (1) → (Many) portfolio_holdings
++vault_categories (1) → (Many) asset_category_assignment
++watchlists (1) → (Many) watchlist_items
++watchlists (1) → (Many) watchlist_shares
++journal_entries (1) → (1) manual_trade_logs
++manual_trade_logs (1) → (1) trade_analysis
++rebalance_schedule (1) → (Many) rebalance_execution
++```
++
++## Migration from SQLite
++
++### Key Differences
++
++| SQLite | PostgreSQL |
++|--------|------------|
++| INTEGER AUTOINCREMENT | UUID DEFAULT uuid_generate_v4() |
++| REAL | DECIMAL(20,2) or DECIMAL(10,4) |
++| TEXT (timestamps) | TIMESTAMPTZ |
++| TEXT (JSON) | JSONB |
++| Limited constraints | Full CHECK constraints |
++| datetime('now') | CURRENT_TIMESTAMP |
++
++### Migration Strategy
++
++1. **Phase 1**: Core authentication and portfolio (01-02)
++2. **Phase 2**: Trading features (03-04)
++3. **Phase 3**: User configuration (05-07)
++4. **Phase 4**: Advanced features (08-09)
++5. **Phase 5**: Analytics (10 - consider partitioning)
++
++### Data Migration Considerations
++
++- **UUID Generation**: Existing INTEGER IDs need UUID mapping
++- **JSON Conversion**: TEXT JSON → JSONB (automatic casting works)
++- **Timestamp Conversion**: TEXT dates → TIMESTAMPTZ
++- **Decimal Precision**: REAL → DECIMAL (check for precision loss)
++
++## Performance Tuning
++
++### High-Volume Tables
++- `agent_memory` - Consider monthly partitioning
++- `portfolio_holdings` - Index on (user_id, vault_id, symbol)
++- `manual_trade_logs` - Index on (user_id, trade_date DESC)
++
++### Query Optimization
++- Use prepared statements for common queries
++- Implement connection pooling
++- Consider materialized views for dashboard metrics
++- Use partial indexes for filtered queries
++
++### Monitoring
++- Track slow queries (log queries > 100ms)
++- Monitor table bloat and run VACUUM regularly
++- Monitor index usage and remove unused indexes
++- Set up pg_stat_statements for query analysis
++
++## Maintenance
++
++### Regular Tasks
++- **Daily**: Monitor database size and slow queries
++- **Weekly**: Analyze query patterns, update statistics
++- **Monthly**: Review and archive old agent_memory logs
++- **Quarterly**: Review index usage, optimize as needed
++
++### Backup Strategy
++- **Full Backup**: Daily at 2 AM UTC
++- **Incremental**: Every 6 hours
++- **Point-in-Time Recovery**: WAL archiving enabled
++- **Retention**: 30 days online, 1 year archived
++
++## Security Considerations
++
++### Access Control
++- Application user has limited DML permissions only
++- Admin user for DDL operations kept separate
++- Row-level security policies can be added per tenant
++
++### Data Protection
++- Passwords stored as bcrypt hashes
++- Sensitive PII fields should be encrypted at application layer
++- Consider encrypting: hashed_password, tax_identification_number
++
++### Audit Trail
++- All user actions logged in agent_memory
++- Database triggers log UPDATE/DELETE on critical tables
++- Consider adding audit columns: created_by, updated_by
++
++## Future Enhancements
++
++### Planned Features
++- Row-level security for multi-tenancy
++- Partitioning for agent_memory (by month)
++- Materialized views for analytics dashboards
++- Full-text search on journal entries
++- TimescaleDB extension for time-series data
++- PostGIS extension for geographic data (if needed)
++
++### Market Intelligence Storage
++The following features currently return mock data and will need persistent storage:
++- Market data (prices, historical data)
++- Institutional flow tracking
++- Smart money signals
++- Dark pool trades
++- Insider trading filings
++- Sovereign/macro signals
++- Backtest results
++
++## Support & Documentation
++
++### Related Documentation
++- `/docs/api/` - API endpoint documentation
++- `/docs/architecture/` - System architecture
++- `/server/database/migrations/` - Alembic migration scripts
++
++### Contact
++- Technical Lead: andy@sovereignassets.org
++- Repository: scarramanga/StackMotive_Final
++
++---
++
++**Last Updated**: October 5, 2025  
++**Schema Version**: 1.0.0  
++**PostgreSQL Compatibility**: 14+
+-- 
+2.34.1
+
