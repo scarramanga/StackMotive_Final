@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import Base, engine
+from contextlib import asynccontextmanager
+from database import Base, engine, init_db_pool, close_db_pool
 from auth import get_current_user
 
-# Import MVP routes
 from routes.dca_stop_loss import router as dca_stop_loss_router
 from routes.institutional_flow import router as institutional_flow_router
 from routes.market_data import router as market_data_router
@@ -15,10 +15,15 @@ from routes.rebalance_scheduler import router as rebalance_scheduler_router
 from routes.user import router as user_router
 from routes.watchlist import router as watchlist_router
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db_pool()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    await close_db_pool()
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # Basic CORS
 app.add_middleware(

@@ -2,11 +2,10 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
-import sqlite3
-from pathlib import Path
 import random
 import math
 from pydantic import BaseModel
+from database import get_db_connection
 
 router = APIRouter()
 
@@ -29,11 +28,6 @@ class RebalanceRiskResponse(BaseModel):
     riskLevel: str  # "LOW", "MEDIUM", "HIGH", "CRITICAL"
     lastUpdated: str
     nextRebalanceRecommended: Optional[str] = None
-
-# Database connection
-def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
 
 # Risk calculation functions
 def calculate_drift_risk(holdings: List[Dict], target_weights: Dict[str, float]) -> Dict[str, Any]:
@@ -205,31 +199,28 @@ def calculate_volatility_risk(holdings: List[Dict]) -> Dict[str, Any]:
         "mediumVolExposure": medium_vol_exposure
     }
 
-def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
+async def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
     """Main function to calculate rebalance risks"""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Get current portfolio holdings
-        cursor.execute("""
-            SELECT symbol, market_value, quantity, asset_class, sector
-            FROM PortfolioHoldings 
-            WHERE userId = ?
-            ORDER BY market_value DESC
-        """, (user_id,))
-        
-        holdings_data = cursor.fetchall()
-        holdings = [
-            {
-                'symbol': row[0],
-                'market_value': row[1],
-                'quantity': row[2],
-                'asset_class': row[3],
-                'sector': row[4]
-            }
-            for row in holdings_data
-        ]
+        async with get_db_connection() as conn:
+            # Get current portfolio holdings
+            holdings_data = await conn.fetch("""
+                SELECT symbol, market_value, quantity, asset_class, sector
+                FROM portfolio_holdings 
+                WHERE user_id = $1
+                ORDER BY market_value DESC
+            """, user_id)
+            
+            holdings = [
+                {
+                    'symbol': row['symbol'],
+                    'market_value': row['market_value'],
+                    'quantity': row['quantity'],
+                    'asset_class': row['asset_class'],
+                    'sector': row['sector']
+                }
+                for row in holdings_data
+            ]
         
         # Get target weights (simulated - in real implementation, this would come from strategy settings)
         target_weights = {
@@ -364,8 +355,6 @@ def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
         else:
             next_rebalance = "No immediate action required"
         
-        conn.close()
-        
         return RebalanceRiskResponse(
             risks=top_risks,
             totalRiskScore=total_risk_score,
@@ -389,7 +378,7 @@ async def get_rebalance_risks_endpoint(
     """
     try:
         # Get rebalance risks
-        risk_response = get_rebalance_risks(user_id)
+        risk_response = await get_rebalance_risks(user_id)
         
         return risk_response.dict()
         
@@ -411,7 +400,7 @@ async def get_risk_summary(
     """
     try:
         # Get current risks
-        risk_response = get_rebalance_risks(user_id)
+        risk_response = await get_rebalance_risks(user_id)
         
         # Calculate risk category breakdown
         risk_categories = {}
@@ -442,4 +431,4 @@ async def get_risk_summary(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to retrieve risk summary: {str(e)}"
-        ) 
+        )    

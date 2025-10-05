@@ -1,0 +1,3395 @@
+From 16fdceb495ddd93bc897b5699af57bed64b7d823 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 22:36:27 +0000
+Subject: [PATCH 1/7] feat: Update core infrastructure for async PostgreSQL
+ with asyncpg connection pooling
+
+- Update database.py to use asyncpg with connection pool (5-20 connections)
+- Add asyncpg and psycopg2-binary to requirements.txt
+- Add PostgreSQL service to docker-compose.yml with health checks
+- Update main.py with lifespan events for database pool init/cleanup
+- Update User model with UUID primary keys and additional onboarding fields
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ docker-compose.yml      | 33 +++++++++++++++++--
+ server/database.py      | 71 ++++++++++++++++++++++++++++++-----------
+ server/main.py          | 15 ++++++---
+ server/models/user.py   | 25 ++++++++++-----
+ server/requirements.txt |  7 ++--
+ 5 files changed, 115 insertions(+), 36 deletions(-)
+
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a0c0aae..7806b24 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,5 +1,25 @@
+ version: '3.8'
+ services:
++  postgres:
++    image: postgres:15-alpine
++    container_name: stackmotive-postgres
++    environment:
++      - POSTGRES_DB=stackmotive
++      - POSTGRES_USER=stackmotive
++      - POSTGRES_PASSWORD=stackmotive
++    ports:
++      - "5432:5432"
++    volumes:
++      - postgres_data:/var/lib/postgresql/data
++      - ./server/database/schemas:/docker-entrypoint-initdb.d
++    networks:
++      - stackmotive-network
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U stackmotive"]
++      interval: 10s
++      timeout: 5s
++      retries: 5
++
+   frontend:
+     build:
+       context: .
+@@ -7,7 +27,10 @@ services:
+     ports:
+       - "3000:80"
+     depends_on:
+-      - backend
++      postgres:
++        condition: service_healthy
++      backend:
++        condition: service_started
+     environment:
+       - REACT_APP_API_URL=http://localhost:8000
+     networks:
+@@ -19,8 +42,11 @@ services:
+       dockerfile: docker/backend.Dockerfile
+     ports:
+       - "8000:8000"
++    depends_on:
++      postgres:
++        condition: service_healthy
+     environment:
+-      - DATABASE_URL=sqlite:///./stackmotive.db
++      - DATABASE_URL=postgresql://stackmotive:stackmotive@postgres:5432/stackmotive
+       - SECRET_KEY=your-secret-key-here
+       - CORS_ORIGINS=http://localhost:3000
+     volumes:
+@@ -32,3 +58,6 @@ services:
+ networks:
+   stackmotive-network:
+     driver: bridge
++
++volumes:
++  postgres_data:
+diff --git a/server/database.py b/server/database.py
+index ed36495..9338a62 100644
+--- a/server/database.py
++++ b/server/database.py
+@@ -1,27 +1,62 @@
+-from sqlalchemy import create_engine
++from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+ from sqlalchemy.ext.declarative import declarative_base
+-from sqlalchemy.orm import sessionmaker
++import asyncpg
+ import os
++from contextlib import asynccontextmanager
+ 
+-# Use SQLite for development
+-SQLALCHEMY_DATABASE_URL = "sqlite:///./dev.db"
++DATABASE_URL = os.getenv(
++    "DATABASE_URL",
++    "postgresql+asyncpg://stackmotive:stackmotive@localhost:5432/stackmotive"
++)
+ 
+-# Create engine with SQLite support for async
+-engine = create_engine(
+-    SQLALCHEMY_DATABASE_URL,
+-    connect_args={"check_same_thread": False}  # Needed for SQLite
++engine = create_async_engine(
++    DATABASE_URL,
++    echo=False,
++    pool_pre_ping=True,
++    pool_size=10,
++    max_overflow=20
+ )
+ 
+-# Create session factory
+-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++AsyncSessionLocal = async_sessionmaker(
++    engine,
++    class_=AsyncSession,
++    expire_on_commit=False
++)
+ 
+-# Create base class for declarative models
+ Base = declarative_base()
+ 
+-# Dependency to get database session
+-def get_db():
+-    db = SessionLocal()
+-    try:
+-        yield db
+-    finally:
+-        db.close()
++_db_pool = None
++
++async def init_db_pool():
++    global _db_pool
++    db_url = os.getenv("DATABASE_URL", "postgresql://stackmotive:stackmotive@localhost:5432/stackmotive")
++    if db_url.startswith("postgresql+asyncpg://"):
++        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
++    
++    _db_pool = await asyncpg.create_pool(
++        db_url,
++        min_size=5,
++        max_size=20,
++        command_timeout=60
++    )
++
++async def close_db_pool():
++    global _db_pool
++    if _db_pool:
++        await _db_pool.close()
++
++async def get_db_pool():
++    return _db_pool
++
++async def get_db():
++    async with AsyncSessionLocal() as session:
++        try:
++            yield session
++        finally:
++            await session.close()
++
++@asynccontextmanager
++async def get_db_connection():
++    pool = await get_db_pool()
++    async with pool.acquire() as conn:
++        yield conn
+diff --git a/server/main.py b/server/main.py
+index 41f36a4..ffdba0d 100644
+--- a/server/main.py
++++ b/server/main.py
+@@ -1,9 +1,9 @@
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+-from database import Base, engine
++from contextlib import asynccontextmanager
++from database import Base, engine, init_db_pool, close_db_pool
+ from auth import get_current_user
+ 
+-# Import MVP routes
+ from routes.dca_stop_loss import router as dca_stop_loss_router
+ from routes.institutional_flow import router as institutional_flow_router
+ from routes.market_data import router as market_data_router
+@@ -15,10 +15,15 @@ from routes.rebalance_scheduler import router as rebalance_scheduler_router
+ from routes.user import router as user_router
+ from routes.watchlist import router as watchlist_router
+ 
+-# Create database tables
+-Base.metadata.create_all(bind=engine)
++@asynccontextmanager
++async def lifespan(app: FastAPI):
++    await init_db_pool()
++    async with engine.begin() as conn:
++        await conn.run_sync(Base.metadata.create_all)
++    yield
++    await close_db_pool()
+ 
+-app = FastAPI()
++app = FastAPI(lifespan=lifespan)
+ 
+ # Basic CORS
+ app.add_middleware(
+diff --git a/server/models/user.py b/server/models/user.py
+index 40aac4a..374d07b 100644
+--- a/server/models/user.py
++++ b/server/models/user.py
+@@ -1,14 +1,23 @@
+-from sqlalchemy import Boolean, Column, String, DateTime
++from sqlalchemy import Boolean, Column, String, DateTime, Integer
++from sqlalchemy.dialects.postgresql import UUID
+ from sqlalchemy.sql import func
++import uuid
+ from ..database import Base
+ 
+ class User(Base):
+     __tablename__ = "users"
+ 
+-    id = Column(String, primary_key=True, index=True)
+-    email = Column(String, unique=True, index=True)
+-    hashed_password = Column(String)
+-    tier = Column(String, default="observer")
+-    is_active = Column(Boolean, default=True)
+-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
++    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
++    email = Column(String, unique=True, index=True, nullable=False)
++    hashed_password = Column(String, nullable=False)
++    tier = Column(String, default="observer", nullable=False)
++    is_active = Column(Boolean, default=True, nullable=False)
++    is_admin = Column(Boolean, default=False, nullable=False)
++    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
++    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
++    
++    has_completed_onboarding = Column(Boolean, default=False)
++    onboarding_step = Column(Integer, default=0)
++    onboarding_completed_at = Column(DateTime(timezone=True), nullable=True)
++    
++    preferred_currency = Column(String, default="USD")
+diff --git a/server/requirements.txt b/server/requirements.txt
+index 2738451..7efde5d 100644
+--- a/server/requirements.txt
++++ b/server/requirements.txt
+@@ -5,8 +5,9 @@ pydantic==2.6.0
+ pydantic[email]==2.6.0
+ 
+ # Database
+-sqlalchemy==2.0.25
+-aiosqlite==0.19.0
++sqlalchemy[asyncio]==2.0.25
++asyncpg==0.29.0
++psycopg2-binary==2.9.9
+ alembic==1.13.1
+ 
+ # Authentication & Security
+@@ -42,4 +43,4 @@ pytest-cov==4.1.0
+ # Development
+ black==23.9.1
+ isort==5.12.0
+-mypy==1.5.1
+\ No newline at end of file
++mypy==1.5.1
+-- 
+2.34.1
+
+
+From 9494d37b748e1239fd3887afb12b955512c700e2 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 22:39:23 +0000
+Subject: [PATCH 2/7] feat: Migrate rebalance risk routes to async PostgreSQL
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/routes/rebalance_risk.py | 59 ++++++++++++++-------------------
+ 1 file changed, 24 insertions(+), 35 deletions(-)
+
+diff --git a/server/routes/rebalance_risk.py b/server/routes/rebalance_risk.py
+index c615cfa..a0c500f 100644
+--- a/server/routes/rebalance_risk.py
++++ b/server/routes/rebalance_risk.py
+@@ -2,11 +2,10 @@ from fastapi import APIRouter, HTTPException, Query
+ from typing import List, Optional, Dict, Any
+ from datetime import datetime, timedelta
+ import json
+-import sqlite3
+-from pathlib import Path
+ import random
+ import math
+ from pydantic import BaseModel
++from database import get_db_connection
+ 
+ router = APIRouter()
+ 
+@@ -30,11 +29,6 @@ class RebalanceRiskResponse(BaseModel):
+     lastUpdated: str
+     nextRebalanceRecommended: Optional[str] = None
+ 
+-# Database connection
+-def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
+-
+ # Risk calculation functions
+ def calculate_drift_risk(holdings: List[Dict], target_weights: Dict[str, float]) -> Dict[str, Any]:
+     """Calculate drift risk based on actual vs target weights"""
+@@ -205,31 +199,28 @@ def calculate_volatility_risk(holdings: List[Dict]) -> Dict[str, Any]:
+         "mediumVolExposure": medium_vol_exposure
+     }
+ 
+-def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
++async def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
+     """Main function to calculate rebalance risks"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Get current portfolio holdings
+-        cursor.execute("""
+-            SELECT symbol, market_value, quantity, asset_class, sector
+-            FROM PortfolioHoldings 
+-            WHERE userId = ?
+-            ORDER BY market_value DESC
+-        """, (user_id,))
+-        
+-        holdings_data = cursor.fetchall()
+-        holdings = [
+-            {
+-                'symbol': row[0],
+-                'market_value': row[1],
+-                'quantity': row[2],
+-                'asset_class': row[3],
+-                'sector': row[4]
+-            }
+-            for row in holdings_data
+-        ]
++        async with get_db_connection() as conn:
++            # Get current portfolio holdings
++            holdings_data = await conn.fetch("""
++                SELECT symbol, market_value, quantity, asset_class, sector
++                FROM portfolio_holdings 
++                WHERE user_id = $1
++                ORDER BY market_value DESC
++            """, user_id)
++            
++            holdings = [
++                {
++                    'symbol': row['symbol'],
++                    'market_value': row['market_value'],
++                    'quantity': row['quantity'],
++                    'asset_class': row['asset_class'],
++                    'sector': row['sector']
++                }
++                for row in holdings_data
++            ]
+         
+         # Get target weights (simulated - in real implementation, this would come from strategy settings)
+         target_weights = {
+@@ -364,8 +355,6 @@ def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
+         else:
+             next_rebalance = "No immediate action required"
+         
+-        conn.close()
+-        
+         return RebalanceRiskResponse(
+             risks=top_risks,
+             totalRiskScore=total_risk_score,
+@@ -389,7 +378,7 @@ async def get_rebalance_risks_endpoint(
+     """
+     try:
+         # Get rebalance risks
+-        risk_response = get_rebalance_risks(user_id)
++        risk_response = await get_rebalance_risks(user_id)
+         
+         return risk_response.dict()
+         
+@@ -411,7 +400,7 @@ async def get_risk_summary(
+     """
+     try:
+         # Get current risks
+-        risk_response = get_rebalance_risks(user_id)
++        risk_response = await get_rebalance_risks(user_id)
+         
+         # Calculate risk category breakdown
+         risk_categories = {}
+@@ -442,4 +431,4 @@ async def get_risk_summary(
+         raise HTTPException(
+             status_code=500,
+             detail=f"Failed to retrieve risk summary: {str(e)}"
+-        ) 
+\ No newline at end of file
++        )    
+\ No newline at end of file
+-- 
+2.34.1
+
+
+From 76b8f87c0bc238c4390cd468a6a4cf73849bde5c Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 22:42:22 +0000
+Subject: [PATCH 3/7] feat: Migrate DCA/Stop-Loss routes to async PostgreSQL
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/routes/dca_stop_loss.py | 744 ++++++++++++++-------------------
+ 1 file changed, 322 insertions(+), 422 deletions(-)
+
+diff --git a/server/routes/dca_stop_loss.py b/server/routes/dca_stop_loss.py
+index 2b1699b..b4eefb6 100644
+--- a/server/routes/dca_stop_loss.py
++++ b/server/routes/dca_stop_loss.py
+@@ -3,8 +3,7 @@ from pydantic import BaseModel
+ from typing import Optional, List, Dict, Any
+ import json
+ from datetime import datetime, timedelta
+-import sqlite3
+-from pathlib import Path
++from database import get_db_connection
+ 
+ router = APIRouter()
+ 
+@@ -29,85 +28,51 @@ class RuleExecution(BaseModel):
+     success: bool
+     errorMessage: Optional[str] = None
+ 
+-# Database connection
+-def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
+-
+ # Agent Memory logging
+-async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
++async def log_to_agent_memory(user_id: str, action_type: str, action_summary: str, input_data: Optional[str], output_data: str, metadata: Dict[str, Any]):
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            INSERT INTO AgentMemory 
+-            (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-        """, (
+-            user_id,
+-            "block_10",
+-            action_type,
+-            action_summary,
+-            input_data,
+-            output_data,
+-            json.dumps(metadata) if metadata else None,
+-            datetime.now().isoformat(),
+-            f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+-        ))
+-        
+-        conn.commit()
+-        conn.close()
+-        
++        async with get_db_connection() as conn:
++            await conn.execute("""
++                INSERT INTO agent_memory 
++                (user_id, block_id, action, context, user_input, agent_response, metadata, timestamp, session_id)
++                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
++            """,
++                user_id,
++                "block_10",
++                action_type,
++                action_summary,
++                input_data,
++                output_data,
++                json.dumps(metadata) if metadata else None,
++                datetime.now(),
++                f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
++            )
+     except Exception as e:
+         print(f"Failed to log to agent memory: {e}")
+ 
+ @router.get("/rules/user/{user_id}")
+-async def get_user_trade_rules(user_id: int):
++async def get_user_trade_rules(user_id: str):
+     """Get all trade rules for a user"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create UserTradeRules table if it doesn't exist
+-        cursor.execute("""
+-            CREATE TABLE IF NOT EXISTS UserTradeRule (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                userId INTEGER NOT NULL,
+-                symbol TEXT NOT NULL,
+-                ruleType TEXT NOT NULL,
+-                threshold REAL NOT NULL,
+-                frequency TEXT,
+-                amount REAL,
+-                enabled BOOLEAN NOT NULL DEFAULT 1,
+-                lastTriggered TEXT,
+-                createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                FOREIGN KEY (userId) REFERENCES User (id)
++        async with get_db_connection() as conn:
++            rows = await conn.fetch("""
++                SELECT * FROM user_trade_rules 
++                WHERE user_id = $1
++                ORDER BY created_at DESC
++            """, user_id)
++            
++            rules = [dict(row) for row in rows]
++            
++            await log_to_agent_memory(
++                user_id,
++                "trade_rules_retrieved",
++                f"Retrieved {len(rules)} trade rules",
++                None,
++                f"Found {len(rules)} active trade rules",
++                {"ruleCount": len(rules)}
+             )
+-        """)
+-        
+-        cursor.execute("""
+-            SELECT * FROM UserTradeRule 
+-            WHERE userId = ?
+-            ORDER BY createdAt DESC
+-        """, (user_id,))
+-        
+-        columns = [description[0] for description in cursor.description]
+-        rules = [dict(zip(columns, row)) for row in cursor.fetchall()]
+-        
+-        conn.close()
+-        
+-        await log_to_agent_memory(
+-            user_id,
+-            "trade_rules_retrieved",
+-            f"Retrieved {len(rules)} trade rules",
+-            None,
+-            f"Found {len(rules)} active trade rules",
+-            {"ruleCount": len(rules)}
+-        )
+-        
+-        return {"rules": rules}
++            
++            return {"rules": rules}
+         
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+@@ -116,83 +81,72 @@ async def get_user_trade_rules(user_id: int):
+ async def save_trade_rule(rule: UserTradeRule):
+     """Save or update a trade rule"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            INSERT INTO UserTradeRule 
+-            (userId, symbol, ruleType, threshold, frequency, amount, enabled, lastTriggered)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+-        """, (
+-            rule.userId, rule.symbol, rule.ruleType, rule.threshold,
+-            rule.frequency, rule.amount, rule.enabled, rule.lastTriggered
+-        ))
+-        
+-        rule_id = cursor.lastrowid
+-        
+-        conn.commit()
+-        conn.close()
+-        
+-        await log_to_agent_memory(
+-            rule.userId,
+-            "trade_rule_created",
+-            f"Created {rule.ruleType} rule for {rule.symbol}",
+-            rule.json(),
+-            f"Rule created successfully with ID {rule_id}",
+-            {
+-                "ruleId": rule_id,
+-                "symbol": rule.symbol,
+-                "ruleType": rule.ruleType,
+-                "threshold": rule.threshold
++        async with get_db_connection() as conn:
++            rule_id = await conn.fetchval("""
++                INSERT INTO user_trade_rules 
++                (user_id, symbol, rule_type, threshold, frequency, amount, enabled, last_triggered)
++                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
++                RETURNING id
++            """,
++                str(rule.userId), rule.symbol, rule.ruleType, rule.threshold,
++                rule.frequency, rule.amount, rule.enabled, rule.lastTriggered
++            )
++            
++            await log_to_agent_memory(
++                str(rule.userId),
++                "trade_rule_created",
++                f"Created {rule.ruleType} rule for {rule.symbol}",
++                rule.json(),
++                f"Rule created successfully with ID {rule_id}",
++                {
++                    "ruleId": str(rule_id),
++                    "symbol": rule.symbol,
++                    "ruleType": rule.ruleType,
++                    "threshold": rule.threshold
++                }
++            )
++            
++            return {
++                "success": True,
++                "ruleId": str(rule_id),
++                "message": f"{rule.ruleType} rule created for {rule.symbol}"
+             }
+-        )
+-        
+-        return {
+-            "success": True,
+-            "ruleId": rule_id,
+-            "message": f"{rule.ruleType} rule created for {rule.symbol}"
+-        }
+         
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.put("/rules/{rule_id}")
+-async def update_trade_rule(rule_id: int, rule: UserTradeRule):
++async def update_trade_rule(rule_id: str, rule: UserTradeRule):
+     """Update an existing trade rule"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            UPDATE UserTradeRule 
+-            SET threshold = ?, frequency = ?, amount = ?, enabled = ?, updatedAt = ?
+-            WHERE id = ? AND userId = ?
+-        """, (
+-            rule.threshold, rule.frequency, rule.amount, rule.enabled,
+-            datetime.now().isoformat(), rule_id, rule.userId
+-        ))
+-        
+-        if cursor.rowcount == 0:
+-            raise HTTPException(status_code=404, detail="Rule not found or access denied")
+-        
+-        conn.commit()
+-        conn.close()
+-        
+-        await log_to_agent_memory(
+-            rule.userId,
+-            "trade_rule_updated",
+-            f"Updated {rule.ruleType} rule for {rule.symbol}",
+-            rule.json(),
+-            f"Rule {rule_id} updated successfully",
+-            {
+-                "ruleId": rule_id,
+-                "symbol": rule.symbol,
+-                "ruleType": rule.ruleType,
+-                "enabled": rule.enabled
+-            }
+-        )
+-        
+-        return {"success": True, "message": f"Rule {rule_id} updated successfully"}
++        async with get_db_connection() as conn:
++            result = await conn.execute("""
++                UPDATE user_trade_rules 
++                SET threshold = $1, frequency = $2, amount = $3, enabled = $4, updated_at = $5
++                WHERE id = $6 AND user_id = $7
++            """,
++                rule.threshold, rule.frequency, rule.amount, rule.enabled,
++                datetime.now(), rule_id, str(rule.userId)
++            )
++            
++            if result == "UPDATE 0":
++                raise HTTPException(status_code=404, detail="Rule not found or access denied")
++            
++            await log_to_agent_memory(
++                str(rule.userId),
++                "trade_rule_updated",
++                f"Updated {rule.ruleType} rule for {rule.symbol}",
++                rule.json(),
++                f"Rule {rule_id} updated successfully",
++                {
++                    "ruleId": rule_id,
++                    "symbol": rule.symbol,
++                    "ruleType": rule.ruleType,
++                    "enabled": rule.enabled
++                }
++            )
++            
++            return {"success": True, "message": f"Rule {rule_id} updated successfully"}
+         
+     except HTTPException:
+         raise
+@@ -200,45 +154,37 @@ async def update_trade_rule(rule_id: int, rule: UserTradeRule):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.delete("/rules/{rule_id}/{user_id}")
+-async def delete_trade_rule(rule_id: int, user_id: int):
++async def delete_trade_rule(rule_id: str, user_id: str):
+     """Delete a trade rule"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Get rule info for logging
+-        cursor.execute("""
+-            SELECT symbol, ruleType FROM UserTradeRule 
+-            WHERE id = ? AND userId = ?
+-        """, (rule_id, user_id))
+-        
+-        rule_info = cursor.fetchone()
+-        if not rule_info:
+-            raise HTTPException(status_code=404, detail="Rule not found or access denied")
+-        
+-        # Delete rule
+-        cursor.execute("""
+-            DELETE FROM UserTradeRule 
+-            WHERE id = ? AND userId = ?
+-        """, (rule_id, user_id))
+-        
+-        conn.commit()
+-        conn.close()
+-        
+-        await log_to_agent_memory(
+-            user_id,
+-            "trade_rule_deleted",
+-            f"Deleted {rule_info[1]} rule for {rule_info[0]}",
+-            f"rule_id: {rule_id}",
+-            f"Rule {rule_id} deleted successfully",
+-            {
+-                "ruleId": rule_id,
+-                "symbol": rule_info[0],
+-                "ruleType": rule_info[1]
+-            }
+-        )
+-        
+-        return {"success": True, "message": f"Rule {rule_id} deleted successfully"}
++        async with get_db_connection() as conn:
++            rule_info = await conn.fetchrow("""
++                SELECT symbol, rule_type FROM user_trade_rules 
++                WHERE id = $1 AND user_id = $2
++            """, rule_id, user_id)
++            
++            if not rule_info:
++                raise HTTPException(status_code=404, detail="Rule not found or access denied")
++            
++            await conn.execute("""
++                DELETE FROM user_trade_rules 
++                WHERE id = $1 AND user_id = $2
++            """, rule_id, user_id)
++            
++            await log_to_agent_memory(
++                user_id,
++                "trade_rule_deleted",
++                f"Deleted {rule_info['rule_type']} rule for {rule_info['symbol']}",
++                f"rule_id: {rule_id}",
++                f"Rule {rule_id} deleted successfully",
++                {
++                    "ruleId": rule_id,
++                    "symbol": rule_info['symbol'],
++                    "ruleType": rule_info['rule_type']
++                }
++            )
++            
++            return {"success": True, "message": f"Rule {rule_id} deleted successfully"}
+         
+     except HTTPException:
+         raise
+@@ -246,84 +192,62 @@ async def delete_trade_rule(rule_id: int, user_id: int):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.post("/rules/execute/{rule_id}")
+-async def execute_trade_rule(rule_id: int, execution: RuleExecution):
++async def execute_trade_rule(rule_id: str, execution: RuleExecution):
+     """Execute a trade rule (simulate execution)"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create RuleExecution table if it doesn't exist
+-        cursor.execute("""
+-            CREATE TABLE IF NOT EXISTS RuleExecution (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                ruleId INTEGER NOT NULL,
+-                executionType TEXT NOT NULL,
+-                quantity REAL NOT NULL,
+-                price REAL NOT NULL,
+-                success BOOLEAN NOT NULL,
+-                errorMessage TEXT,
+-                executedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                FOREIGN KEY (ruleId) REFERENCES UserTradeRule (id)
++        async with get_db_connection() as conn:
++            rule_data = await conn.fetchrow("""
++                SELECT user_id, symbol, rule_type, threshold FROM user_trade_rules 
++                WHERE id = $1
++            """, rule_id)
++            
++            if not rule_data:
++                raise HTTPException(status_code=404, detail="Rule not found")
++            
++            user_id = rule_data['user_id']
++            symbol = rule_data['symbol']
++            rule_type = rule_data['rule_type']
++            threshold = rule_data['threshold']
++            
++            execution_id = await conn.fetchval("""
++                INSERT INTO rule_executions 
++                (rule_id, execution_type, quantity, price, success, error_message)
++                VALUES ($1, $2, $3, $4, $5, $6)
++                RETURNING id
++            """,
++                rule_id, execution.executionType, execution.quantity, 
++                execution.price, execution.success, execution.errorMessage
+             )
+-        """)
+-        
+-        # Get rule details
+-        cursor.execute("""
+-            SELECT userId, symbol, ruleType, threshold FROM UserTradeRule 
+-            WHERE id = ?
+-        """, (rule_id,))
+-        
+-        rule_data = cursor.fetchone()
+-        if not rule_data:
+-            raise HTTPException(status_code=404, detail="Rule not found")
+-        
+-        user_id, symbol, rule_type, threshold = rule_data
+-        
+-        # Record execution
+-        cursor.execute("""
+-            INSERT INTO RuleExecution 
+-            (ruleId, executionType, quantity, price, success, errorMessage)
+-            VALUES (?, ?, ?, ?, ?, ?)
+-        """, (
+-            rule_id, execution.executionType, execution.quantity, 
+-            execution.price, execution.success, execution.errorMessage
+-        ))
+-        
+-        execution_id = cursor.lastrowid
+-        
+-        # Update rule's last triggered time if successful
+-        if execution.success:
+-            cursor.execute("""
+-                UPDATE UserTradeRule 
+-                SET lastTriggered = ?, updatedAt = ?
+-                WHERE id = ?
+-            """, (datetime.now().isoformat(), datetime.now().isoformat(), rule_id))
+-        
+-        conn.commit()
+-        conn.close()
+-        
+-        await log_to_agent_memory(
+-            user_id,
+-            "trade_rule_executed",
+-            f"Executed {rule_type} rule for {symbol}",
+-            execution.json(),
+-            f"Rule execution {'successful' if execution.success else 'failed'}",
+-            {
+-                "executionId": execution_id,
+-                "ruleId": rule_id,
+-                "symbol": symbol,
+-                "ruleType": rule_type,
+-                "quantity": execution.quantity,
+-                "price": execution.price,
+-                "success": execution.success
++            
++            if execution.success:
++                await conn.execute("""
++                    UPDATE user_trade_rules 
++                    SET last_triggered = $1, updated_at = $2
++                    WHERE id = $3
++                """, datetime.now(), datetime.now(), rule_id)
++            
++            await log_to_agent_memory(
++                str(user_id),
++                "trade_rule_executed",
++                f"Executed {rule_type} rule for {symbol}",
++                execution.json(),
++                f"Rule execution {'successful' if execution.success else 'failed'}",
++                {
++                    "executionId": str(execution_id),
++                    "ruleId": rule_id,
++                    "symbol": symbol,
++                    "ruleType": rule_type,
++                    "quantity": execution.quantity,
++                    "price": execution.price,
++                    "success": execution.success
++                }
++            )
++            
++            return {
++                "success": execution.success,
++                "executionId": str(execution_id),
++                "message": f"Rule execution {'completed' if execution.success else 'failed'}"
+             }
+-        )
+-        
+-        return {
+-            "success": execution.success,
+-            "executionId": execution_id,
+-            "message": f"Rule execution {'completed' if execution.success else 'failed'}"
+-        }
+         
+     except HTTPException:
+         raise
+@@ -331,202 +255,178 @@ async def execute_trade_rule(rule_id: int, execution: RuleExecution):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/rules/history/{user_id}")
+-async def get_rule_execution_history(user_id: int, limit: int = 20):
++async def get_rule_execution_history(user_id: str, limit: int = 20):
+     """Get execution history for user's rules"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            SELECT 
+-                re.*,
+-                utr.symbol,
+-                utr.ruleType,
+-                utr.threshold
+-            FROM RuleExecution re
+-            JOIN UserTradeRule utr ON re.ruleId = utr.id
+-            WHERE utr.userId = ?
+-            ORDER BY re.executedAt DESC
+-            LIMIT ?
+-        """, (user_id, limit))
+-        
+-        columns = [description[0] for description in cursor.description]
+-        history = [dict(zip(columns, row)) for row in cursor.fetchall()]
+-        
+-        conn.close()
+-        
+-        return {"history": history}
++        async with get_db_connection() as conn:
++            rows = await conn.fetch("""
++                SELECT 
++                    re.*,
++                    utr.symbol,
++                    utr.rule_type,
++                    utr.threshold
++                FROM rule_executions re
++                JOIN user_trade_rules utr ON re.rule_id = utr.id
++                WHERE utr.user_id = $1
++                ORDER BY re.executed_at DESC
++                LIMIT $2
++            """, user_id, limit)
++            
++            history = [dict(row) for row in rows]
++            
++            return {"history": history}
+         
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.post("/rules/check-triggers/{user_id}")
+-async def check_rule_triggers(user_id: int):
++async def check_rule_triggers(user_id: str):
+     """Check if any rules should be triggered based on current market conditions"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Get enabled rules
+-        cursor.execute("""
+-            SELECT * FROM UserTradeRule 
+-            WHERE userId = ? AND enabled = 1
+-        """, (user_id,))
+-        
+-        columns = [description[0] for description in cursor.description]
+-        rules = [dict(zip(columns, row)) for row in cursor.fetchall()]
+-        
+-        triggered_rules = []
+-        
+-        for rule in rules:
+-            symbol = rule['symbol']
+-            rule_type = rule['ruleType']
+-            threshold = rule['threshold']
++        async with get_db_connection() as conn:
++            rows = await conn.fetch("""
++                SELECT * FROM user_trade_rules 
++                WHERE user_id = $1 AND enabled = true
++            """, user_id)
+             
+-            # Get current price for the symbol
+-            cursor.execute("""
+-                SELECT currentPrice FROM PortfolioPosition 
+-                WHERE symbol = ? AND userId = ?
+-                ORDER BY lastUpdated DESC
+-                LIMIT 1
+-            """, (symbol, user_id))
++            rules = [dict(row) for row in rows]
++            triggered_rules = []
+             
+-            price_result = cursor.fetchone()
+-            if not price_result:
+-                continue
++            for rule in rules:
++                symbol = rule['symbol']
++                rule_type = rule['rule_type']
++                threshold = rule['threshold']
+                 
+-            current_price = price_result[0]
+-            
+-            # Check if rule should trigger
+-            should_trigger = False
+-            trigger_reason = ""
+-            
+-            if rule_type == "DCA":
+-                # DCA triggers based on frequency or price target
+-                last_triggered = rule.get('lastTriggered')
+-                frequency = rule.get('frequency', 'monthly')
++                price_row = await conn.fetchrow("""
++                    SELECT current_price FROM portfolio_holdings 
++                    WHERE symbol = $1 AND user_id = $2
++                    ORDER BY last_updated DESC
++                    LIMIT 1
++                """, symbol, user_id)
+                 
+-                if last_triggered:
+-                    last_date = datetime.fromisoformat(last_triggered)
+-                    days_since = (datetime.now() - last_date).days
++                if not price_row:
++                    continue
+                     
+-                    if frequency == "daily" and days_since >= 1:
+-                        should_trigger = True
+-                        trigger_reason = "Daily DCA schedule"
+-                    elif frequency == "weekly" and days_since >= 7:
++                current_price = price_row['current_price']
++                
++                should_trigger = False
++                trigger_reason = ""
++                
++                if rule_type == "DCA":
++                    last_triggered = rule.get('last_triggered')
++                    frequency = rule.get('frequency', 'monthly')
++                    
++                    if last_triggered:
++                        days_since = (datetime.now() - last_triggered).days
++                        
++                        if frequency == "daily" and days_since >= 1:
++                            should_trigger = True
++                            trigger_reason = "Daily DCA schedule"
++                        elif frequency == "weekly" and days_since >= 7:
++                            should_trigger = True
++                            trigger_reason = "Weekly DCA schedule"
++                        elif frequency == "monthly" and days_since >= 30:
++                            should_trigger = True
++                            trigger_reason = "Monthly DCA schedule"
++                    else:
+                         should_trigger = True
+-                        trigger_reason = "Weekly DCA schedule"
+-                    elif frequency == "monthly" and days_since >= 30:
++                        trigger_reason = "First DCA execution"
++                        
++                elif rule_type == "Stop-Loss":
++                    if current_price <= threshold:
+                         should_trigger = True
+-                        trigger_reason = "Monthly DCA schedule"
+-                else:
+-                    should_trigger = True
+-                    trigger_reason = "First DCA execution"
+-                    
+-            elif rule_type == "Stop-Loss":
+-                # Stop-loss triggers when price drops below threshold
+-                if current_price <= threshold:
+-                    should_trigger = True
+-                    trigger_reason = f"Price ${current_price} dropped below stop-loss threshold ${threshold}"
++                        trigger_reason = f"Price ${current_price} dropped below stop-loss threshold ${threshold}"
++                
++                if should_trigger:
++                    triggered_rules.append({
++                        "ruleId": str(rule['id']),
++                        "symbol": symbol,
++                        "ruleType": rule_type,
++                        "threshold": threshold,
++                        "currentPrice": current_price,
++                        "triggerReason": trigger_reason,
++                        "suggestedAction": "BUY" if rule_type == "DCA" else "SELL",
++                        "suggestedQuantity": rule.get('amount', 100) / current_price if rule_type == "DCA" else 1.0
++                    })
+             
+-            if should_trigger:
+-                triggered_rules.append({
+-                    "ruleId": rule['id'],
+-                    "symbol": symbol,
+-                    "ruleType": rule_type,
+-                    "threshold": threshold,
+-                    "currentPrice": current_price,
+-                    "triggerReason": trigger_reason,
+-                    "suggestedAction": "BUY" if rule_type == "DCA" else "SELL",
+-                    "suggestedQuantity": rule.get('amount', 100) / current_price if rule_type == "DCA" else 1.0
+-                })
+-        
+-        conn.close()
+-        
+-        await log_to_agent_memory(
+-            user_id,
+-            "rule_triggers_checked",
+-            f"Checked {len(rules)} rules, {len(triggered_rules)} triggers found",
+-            f"user_id: {user_id}",
+-            f"Found {len(triggered_rules)} triggered rules",
+-            {
+-                "totalRules": len(rules),
+-                "triggeredRules": len(triggered_rules),
+-                "triggers": [r['ruleId'] for r in triggered_rules]
++            await log_to_agent_memory(
++                user_id,
++                "rule_triggers_checked",
++                f"Checked {len(rules)} rules, {len(triggered_rules)} triggers found",
++                f"user_id: {user_id}",
++                f"Found {len(triggered_rules)} triggered rules",
++                {
++                    "totalRules": len(rules),
++                    "triggeredRules": len(triggered_rules),
++                    "triggers": [r['ruleId'] for r in triggered_rules]
++                }
++            )
++            
++            return {
++                "triggeredRules": triggered_rules,
++                "totalRulesChecked": len(rules),
++                "lastChecked": datetime.now().isoformat()
+             }
+-        )
+-        
+-        return {
+-            "triggeredRules": triggered_rules,
+-            "totalRulesChecked": len(rules),
+-            "lastChecked": datetime.now().isoformat()
+-        }
+         
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/rules/analytics/{user_id}")
+-async def get_rule_analytics(user_id: int):
++async def get_rule_analytics(user_id: str):
+     """Get analytics for user's trade rules"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Rule summary
+-        cursor.execute("""
+-            SELECT 
+-                ruleType,
+-                COUNT(*) as count,
+-                AVG(threshold) as avgThreshold,
+-                SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) as enabledCount
+-            FROM UserTradeRule 
+-            WHERE userId = ?
+-            GROUP BY ruleType
+-        """, (user_id,))
+-        
+-        rule_summary = [
+-            {
+-                "ruleType": row[0],
+-                "count": row[1],
+-                "avgThreshold": row[2],
+-                "enabledCount": row[3]
+-            }
+-            for row in cursor.fetchall()
+-        ]
+-        
+-        # Execution summary
+-        cursor.execute("""
+-            SELECT 
+-                utr.ruleType,
+-                COUNT(re.id) as totalExecutions,
+-                SUM(CASE WHEN re.success = 1 THEN 1 ELSE 0 END) as successfulExecutions,
+-                AVG(re.quantity) as avgQuantity,
+-                AVG(re.price) as avgPrice
+-            FROM UserTradeRule utr
+-            LEFT JOIN RuleExecution re ON utr.id = re.ruleId
+-            WHERE utr.userId = ?
+-            GROUP BY utr.ruleType
+-        """, (user_id,))
+-        
+-        execution_summary = [
+-            {
+-                "ruleType": row[0],
+-                "totalExecutions": row[1] or 0,
+-                "successfulExecutions": row[2] or 0,
+-                "successRate": (row[2] / row[1] * 100) if row[1] and row[1] > 0 else 0,
+-                "avgQuantity": row[3] or 0,
+-                "avgPrice": row[4] or 0
++        async with get_db_connection() as conn:
++            rule_rows = await conn.fetch("""
++                SELECT 
++                    rule_type,
++                    COUNT(*) as count,
++                    AVG(threshold) as avg_threshold,
++                    COUNT(*) FILTER (WHERE enabled = true) as enabled_count
++                FROM user_trade_rules 
++                WHERE user_id = $1
++                GROUP BY rule_type
++            """, user_id)
++            
++            rule_summary = [
++                {
++                    "ruleType": row['rule_type'],
++                    "count": row['count'],
++                    "avgThreshold": float(row['avg_threshold']) if row['avg_threshold'] else 0,
++                    "enabledCount": row['enabled_count']
++                }
++                for row in rule_rows
++            ]
++            
++            exec_rows = await conn.fetch("""
++                SELECT 
++                    utr.rule_type,
++                    COUNT(re.id) as total_executions,
++                    COUNT(*) FILTER (WHERE re.success = true) as successful_executions,
++                    AVG(re.quantity) as avg_quantity,
++                    AVG(re.price) as avg_price
++                FROM user_trade_rules utr
++                LEFT JOIN rule_executions re ON utr.id = re.rule_id
++                WHERE utr.user_id = $1
++                GROUP BY utr.rule_type
++            """, user_id)
++            
++            execution_summary = [
++                {
++                    "ruleType": row['rule_type'],
++                    "totalExecutions": row['total_executions'] or 0,
++                    "successfulExecutions": row['successful_executions'] or 0,
++                    "successRate": (row['successful_executions'] / row['total_executions'] * 100) if row['total_executions'] and row['total_executions'] > 0 else 0,
++                    "avgQuantity": float(row['avg_quantity']) if row['avg_quantity'] else 0,
++                    "avgPrice": float(row['avg_price']) if row['avg_price'] else 0
++                }
++                for row in exec_rows
++            ]
++            
++            return {
++                "ruleSummary": rule_summary,
++                "executionSummary": execution_summary,
++                "generatedAt": datetime.now().isoformat()
+             }
+-            for row in cursor.fetchall()
+-        ]
+-        
+-        conn.close()
+-        
+-        return {
+-            "ruleSummary": rule_summary,
+-            "executionSummary": execution_summary,
+-            "generatedAt": datetime.now().isoformat()
+-        }
+         
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e)) 
+\ No newline at end of file
+-- 
+2.34.1
+
+
+From dd3e476b891b5d0406ecaa13861924d77c77508f Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 22:52:00 +0000
+Subject: [PATCH 4/7] fix: Add None check for database pool in
+ get_db_connection
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/database.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/server/database.py b/server/database.py
+index 9338a62..1f4bd3d 100644
+--- a/server/database.py
++++ b/server/database.py
+@@ -58,5 +58,7 @@ async def get_db():
+ @asynccontextmanager
+ async def get_db_connection():
+     pool = await get_db_pool()
++    if pool is None:
++        raise RuntimeError("Database pool not initialized. Call init_db_pool() first.")
+     async with pool.acquire() as conn:
+         yield conn
+-- 
+2.34.1
+
+
+From 1f7f412a7478e5ba75acd7c4dbbc6b98a5d4eb3b Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 23:02:46 +0000
+Subject: [PATCH 5/7] feat: Migrate portfolio routes to async PostgreSQL with
+ asyncpg
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/routes/portfolio.py | 552 +++++++++++++++----------------------
+ 1 file changed, 228 insertions(+), 324 deletions(-)
+
+diff --git a/server/routes/portfolio.py b/server/routes/portfolio.py
+index 002726e..d28ccb4 100644
+--- a/server/routes/portfolio.py
++++ b/server/routes/portfolio.py
+@@ -16,9 +16,8 @@ from typing import List, Optional, Dict, Any
+ from pydantic import BaseModel
+ import json
+ from datetime import datetime, timedelta
+-import sqlite3
+-from pathlib import Path
+ import random
++from database import get_db_connection
+ 
+ router = APIRouter()
+ 
+@@ -71,153 +70,104 @@ class CombinedPortfolioResponse(BaseModel):
+     combinedHoldings: List[CombinedHolding]
+     totalValue: float
+ 
+-# Database connection
+-def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
+-
+ # Agent Memory logging
+-async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
++async def log_to_agent_memory(user_id: str, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            INSERT INTO AgentMemory 
+-            (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-        """, (
+-            user_id,
+-            "block_04",
+-            action_type,
+-            action_summary,
+-            input_data,
+-            output_data,
+-            json.dumps(metadata) if metadata else None,
+-            datetime.now().isoformat(),
+-            f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+-        ))
+-        
+-        conn.commit()
+-        conn.close()
+-        
++        async with get_db_connection() as conn:
++            await conn.execute("""
++                INSERT INTO agent_memory 
++                (user_id, block_id, action, context, user_input, agent_response, metadata, timestamp, session_id)
++                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
++            """,
++                user_id,
++                "block_04",
++                action_type,
++                action_summary,
++                input_data,
++                output_data,
++                json.dumps(metadata) if metadata else None,
++                datetime.now(),
++                f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
++            )
+     except Exception as e:
+         print(f"Failed to log to agent memory: {e}")
+ 
+ @router.get("/portfolio/summary")
+ async def get_portfolio_summary(
+     vaultId: Optional[str] = Query(None),
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Get portfolio summary data for dashboard"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create portfolio summary table if it doesn't exist
+-        cursor.execute("""
+-            CREATE TABLE IF NOT EXISTS PortfolioSummary (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                userId INTEGER NOT NULL,
+-                vaultId TEXT,
+-                total_value REAL NOT NULL DEFAULT 0,
+-                cash_balance REAL NOT NULL DEFAULT 0,
+-                holdings_value REAL NOT NULL DEFAULT 0,
+-                net_worth REAL NOT NULL DEFAULT 0,
+-                change_value REAL DEFAULT 0,
+-                change_percent REAL DEFAULT 0,
+-                day_change_value REAL DEFAULT 0,
+-                day_change_percent REAL DEFAULT 0,
+-                total_return REAL DEFAULT 0,
+-                total_return_percent REAL DEFAULT 0,
+-                asset_count INTEGER DEFAULT 0,
+-                last_updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+-            )
+-        """)
+-        
+-        # Get existing summary or create default
+-        where_clause = "WHERE userId = ?"
+-        params = [user_id]
+-        
+-        if vaultId:
+-            where_clause += " AND vaultId = ?"
+-            params.append(vaultId)
+-        else:
+-            where_clause += " AND vaultId IS NULL"
+-        
+-        cursor.execute(f"""
+-            SELECT * FROM PortfolioSummary 
+-            {where_clause}
+-            ORDER BY last_updated DESC 
+-            LIMIT 1
+-        """, params)
+-        
+-        result = cursor.fetchone()
+-        
+-        if not result:
+-            # Create default summary with realistic demo data
+-            total_value = 125000.00
+-            holdings_value = 118500.00
+-            cash_balance = 6500.00
+-            net_worth = total_value
+-            change_value = 2750.50
+-            change_percent = 2.24
+-            day_change_value = 1234.56
+-            day_change_percent = 0.99
+-            total_return = 18500.00
+-            total_return_percent = 17.39
+-            asset_count = 12
++        async with get_db_connection() as conn:
++            where_clause = "WHERE user_id = $1"
++            params = [user_id]
+             
+-            cursor.execute("""
+-                INSERT INTO PortfolioSummary 
+-                (userId, vaultId, total_value, cash_balance, holdings_value, net_worth,
+-                 change_value, change_percent, day_change_value, day_change_percent,
+-                 total_return, total_return_percent, asset_count)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-            """, (
+-                user_id, vaultId, total_value, cash_balance, holdings_value, net_worth,
+-                change_value, change_percent, day_change_value, day_change_percent,
+-                total_return, total_return_percent, asset_count
+-            ))
++            if vaultId:
++                where_clause += " AND vault_id = $2"
++                params.append(vaultId)
++            else:
++                where_clause += " AND vault_id IS NULL"
+             
+-            conn.commit()
+-            
+-            # Return the created summary
+-            summary = PortfolioSummary(
+-                totalValue=total_value,
+-                changePercent=change_percent,
+-                changeValue=change_value,
+-                netWorth=net_worth,
+-                assetCount=asset_count,
+-                dayChangeValue=day_change_value,
+-                dayChangePercent=day_change_percent,
+-                totalReturn=total_return,
+-                totalReturnPercent=total_return_percent,
+-                cashBalance=cash_balance,
+-                holdingsValue=holdings_value,
+-                lastUpdated=datetime.now().isoformat()
+-            )
+-        else:
+-            columns = [description[0] for description in cursor.description]
+-            summary_data = dict(zip(columns, result))
++            result = await conn.fetchrow(f"""
++                SELECT * FROM portfolio_summary 
++                {where_clause}
++                ORDER BY last_updated DESC 
++                LIMIT 1
++            """, *params)
+             
+-            summary = PortfolioSummary(
+-                totalValue=summary_data['total_value'],
+-                changePercent=summary_data['change_percent'],
+-                changeValue=summary_data['change_value'],
+-                netWorth=summary_data['net_worth'],
+-                assetCount=summary_data['asset_count'],
+-                dayChangeValue=summary_data['day_change_value'],
+-                dayChangePercent=summary_data['day_change_percent'],
+-                totalReturn=summary_data['total_return'],
+-                totalReturnPercent=summary_data['total_return_percent'],
+-                cashBalance=summary_data['cash_balance'],
+-                holdingsValue=summary_data['holdings_value'],
+-                lastUpdated=summary_data['last_updated']
+-            )
+-        
+-        conn.close()
++            if not result:
++                total_value = 125000.00
++                holdings_value = 118500.00
++                cash_balance = 6500.00
++                net_worth = total_value
++                change_value = 2750.50
++                change_percent = 2.24
++                day_change_value = 1234.56
++                day_change_percent = 0.99
++                total_return = 18500.00
++                total_return_percent = 17.39
++                asset_count = 12
++                
++                await conn.execute("""
++                    INSERT INTO portfolio_summary 
++                    (user_id, vault_id, portfolio_value, total_gain_loss, total_gain_loss_percent,
++                     day_gain_loss, day_gain_loss_percent, cash_balance, invested_amount, number_of_holdings)
++                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
++                """,
++                    user_id, vaultId, total_value, change_value, change_percent,
++                    day_change_value, day_change_percent, cash_balance, holdings_value, asset_count
++                )
++                
++                summary = PortfolioSummary(
++                    totalValue=total_value,
++                    changePercent=change_percent,
++                    changeValue=change_value,
++                    netWorth=net_worth,
++                    assetCount=asset_count,
++                    dayChangeValue=day_change_value,
++                    dayChangePercent=day_change_percent,
++                    totalReturn=total_return,
++                    totalReturnPercent=total_return_percent,
++                    cashBalance=cash_balance,
++                    holdingsValue=holdings_value,
++                    lastUpdated=datetime.now().isoformat()
++                )
++            else:
++                summary = PortfolioSummary(
++                    totalValue=result['portfolio_value'],
++                    changePercent=result['total_gain_loss_percent'],
++                    changeValue=result['total_gain_loss'],
++                    netWorth=result['portfolio_value'],
++                    assetCount=result['number_of_holdings'],
++                    dayChangeValue=result['day_gain_loss'],
++                    dayChangePercent=result['day_gain_loss_percent'],
++                    totalReturn=result['total_gain_loss'],
++                    totalReturnPercent=result['total_gain_loss_percent'],
++                    cashBalance=result['cash_balance'],
++                    holdingsValue=result['invested_amount'],
++                    lastUpdated=result['last_updated'].isoformat() if hasattr(result['last_updated'], 'isoformat') else str(result['last_updated'])
++                )
+         
+         await log_to_agent_memory(
+             user_id,
+@@ -240,166 +190,123 @@ async def get_portfolio_summary(
+ @router.get("/portfolio/holdings")
+ async def get_portfolio_holdings(
+     vaultId: Optional[str] = Query(None),
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Get portfolio holdings data for dashboard"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create portfolio holdings table if it doesn't exist
+-        cursor.execute("""
+-            CREATE TABLE IF NOT EXISTS PortfolioHoldings (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                userId INTEGER NOT NULL,
+-                vaultId TEXT,
+-                symbol TEXT NOT NULL,
+-                asset_name TEXT,
+-                asset_class TEXT,
+-                sector TEXT,
+-                market TEXT DEFAULT 'NZX',
+-                quantity REAL NOT NULL DEFAULT 0,
+-                average_cost REAL DEFAULT 0,
+-                current_price REAL DEFAULT 0,
+-                market_value REAL NOT NULL DEFAULT 0,
+-                cost_basis REAL DEFAULT 0,
+-                unrealized_pnl REAL DEFAULT 0,
+-                unrealized_pnl_percent REAL DEFAULT 0,
+-                day_change REAL DEFAULT 0,
+-                day_change_percent REAL DEFAULT 0,
+-                portfolio_percent REAL DEFAULT 0,
+-                broker_account TEXT,
+-                last_updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                UNIQUE(userId, vaultId, symbol, broker_account)
+-            )
+-        """)
+-        
+-        # Get existing holdings
+-        where_clause = "WHERE userId = ?"
+-        params = [user_id]
+-        
+-        if vaultId:
+-            where_clause += " AND vaultId = ?"
+-            params.append(vaultId)
+-        else:
+-            where_clause += " AND vaultId IS NULL"
+-        
+-        cursor.execute(f"""
+-            SELECT * FROM PortfolioHoldings 
+-            {where_clause}
+-            ORDER BY market_value DESC
+-        """, params)
+-        
+-        results = cursor.fetchall()
+-        
+-        if not results:
+-            # Create demo holdings data
+-            demo_holdings = [
+-                {
+-                    "symbol": "FPH", "asset_name": "Fisher & Paykel Healthcare Corp", "asset_class": "Healthcare", 
+-                    "sector": "Healthcare Equipment", "market": "NZX", "quantity": 500, "average_cost": 28.50, 
+-                    "current_price": 32.45, "market_value": 16225.00, "cost_basis": 14250.00
+-                },
+-                {
+-                    "symbol": "SPK", "asset_name": "Spark New Zealand Ltd", "asset_class": "Telecommunications", 
+-                    "sector": "Telecom Services", "market": "NZX", "quantity": 800, "average_cost": 4.85, 
+-                    "current_price": 5.12, "market_value": 4096.00, "cost_basis": 3880.00
+-                },
+-                {
+-                    "symbol": "CSL", "asset_name": "CSL Limited", "asset_class": "Healthcare", 
+-                    "sector": "Biotechnology", "market": "ASX", "quantity": 45, "average_cost": 285.60, 
+-                    "current_price": 298.75, "market_value": 13443.75, "cost_basis": 12852.00
+-                },
+-                {
+-                    "symbol": "CBA", "asset_name": "Commonwealth Bank of Australia", "asset_class": "Financial", 
+-                    "sector": "Banks", "market": "ASX", "quantity": 120, "average_cost": 98.20, 
+-                    "current_price": 104.50, "market_value": 12540.00, "cost_basis": 11784.00
+-                },
+-                {
+-                    "symbol": "AAPL", "asset_name": "Apple Inc", "asset_class": "Technology", 
+-                    "sector": "Consumer Electronics", "market": "NASDAQ", "quantity": 75, "average_cost": 145.80, 
+-                    "current_price": 189.45, "market_value": 14208.75, "cost_basis": 10935.00
+-                },
+-                {
+-                    "symbol": "MSFT", "asset_name": "Microsoft Corporation", "asset_class": "Technology", 
+-                    "sector": "Software", "market": "NASDAQ", "quantity": 60, "average_cost": 285.20, 
+-                    "current_price": 325.75, "market_value": 19545.00, "cost_basis": 17112.00
+-                },
+-                {
+-                    "symbol": "TSLA", "asset_name": "Tesla Inc", "asset_class": "Consumer Discretionary", 
+-                    "sector": "Automobiles", "market": "NASDAQ", "quantity": 25, "average_cost": 195.60, 
+-                    "current_price": 248.85, "market_value": 6221.25, "cost_basis": 4890.00
+-                },
+-                {
+-                    "symbol": "VTI", "asset_name": "Vanguard Total Stock Market ETF", "asset_class": "ETF", 
+-                    "sector": "Broad Market", "market": "NYSE", "quantity": 150, "average_cost": 195.40, 
+-                    "current_price": 218.65, "market_value": 32797.50, "cost_basis": 29310.00
+-                }
+-            ]
+-            
+-            for holding in demo_holdings:
+-                unrealized_pnl = holding["market_value"] - holding["cost_basis"]
+-                unrealized_pnl_percent = (unrealized_pnl / holding["cost_basis"]) * 100 if holding["cost_basis"] > 0 else 0
+-                day_change = holding["market_value"] * 0.0085  # Simulate 0.85% daily gain
+-                day_change_percent = 0.85
+-                portfolio_percent = (holding["market_value"] / 125000.00) * 100  # Against total portfolio
+-                
+-                cursor.execute("""
+-                    INSERT OR IGNORE INTO PortfolioHoldings 
+-                    (userId, vaultId, symbol, asset_name, asset_class, sector, market,
+-                     quantity, average_cost, current_price, market_value, cost_basis,
+-                     unrealized_pnl, unrealized_pnl_percent, day_change, day_change_percent,
+-                     portfolio_percent)
+-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-                """, (
+-                    user_id, vaultId, holding["symbol"], holding["asset_name"], 
+-                    holding["asset_class"], holding["sector"], holding["market"],
+-                    holding["quantity"], holding["average_cost"], holding["current_price"],
+-                    holding["market_value"], holding["cost_basis"], unrealized_pnl,
+-                    unrealized_pnl_percent, day_change, day_change_percent, portfolio_percent
+-                ))
++        async with get_db_connection() as conn:
++            where_clause = "WHERE user_id = $1"
++            params = [user_id]
+             
+-            conn.commit()
++            if vaultId:
++                where_clause += " AND vault_id = $2"
++                params.append(vaultId)
++            else:
++                where_clause += " AND vault_id IS NULL"
+             
+-            # Re-fetch the created holdings
+-            cursor.execute(f"""
+-                SELECT * FROM PortfolioHoldings 
++            results = await conn.fetch(f"""
++                SELECT * FROM portfolio_holdings 
+                 {where_clause}
+                 ORDER BY market_value DESC
+-            """, params)
++            """, *params)
+             
+-            results = cursor.fetchall()
+-        
+-        columns = [description[0] for description in cursor.description]
+-        holdings = []
+-        
+-        for row in results:
+-            holding_data = dict(zip(columns, row))
++            if not results:
++                demo_holdings = [
++                    {
++                        "symbol": "FPH", "asset_name": "Fisher & Paykel Healthcare Corp", "asset_class": "Healthcare", 
++                        "sector": "Healthcare Equipment", "market": "NZX", "quantity": 500, "average_cost": 28.50, 
++                        "current_price": 32.45, "market_value": 16225.00, "cost_basis": 14250.00
++                    },
++                    {
++                        "symbol": "SPK", "asset_name": "Spark New Zealand Ltd", "asset_class": "Telecommunications", 
++                        "sector": "Telecom Services", "market": "NZX", "quantity": 800, "average_cost": 4.85, 
++                        "current_price": 5.12, "market_value": 4096.00, "cost_basis": 3880.00
++                    },
++                    {
++                        "symbol": "CSL", "asset_name": "CSL Limited", "asset_class": "Healthcare", 
++                        "sector": "Biotechnology", "market": "ASX", "quantity": 45, "average_cost": 285.60, 
++                        "current_price": 298.75, "market_value": 13443.75, "cost_basis": 12852.00
++                    },
++                    {
++                        "symbol": "CBA", "asset_name": "Commonwealth Bank of Australia", "asset_class": "Financial", 
++                        "sector": "Banks", "market": "ASX", "quantity": 120, "average_cost": 98.20, 
++                        "current_price": 104.50, "market_value": 12540.00, "cost_basis": 11784.00
++                    },
++                    {
++                        "symbol": "AAPL", "asset_name": "Apple Inc", "asset_class": "Technology", 
++                        "sector": "Consumer Electronics", "market": "NASDAQ", "quantity": 75, "average_cost": 145.80, 
++                        "current_price": 189.45, "market_value": 14208.75, "cost_basis": 10935.00
++                    },
++                    {
++                        "symbol": "MSFT", "asset_name": "Microsoft Corporation", "asset_class": "Technology", 
++                        "sector": "Software", "market": "NASDAQ", "quantity": 60, "average_cost": 285.20, 
++                        "current_price": 325.75, "market_value": 19545.00, "cost_basis": 17112.00
++                    },
++                    {
++                        "symbol": "TSLA", "asset_name": "Tesla Inc", "asset_class": "Consumer Discretionary", 
++                        "sector": "Automobiles", "market": "NASDAQ", "quantity": 25, "average_cost": 195.60, 
++                        "current_price": 248.85, "market_value": 6221.25, "cost_basis": 4890.00
++                    },
++                    {
++                        "symbol": "VTI", "asset_name": "Vanguard Total Stock Market ETF", "asset_class": "ETF", 
++                        "sector": "Broad Market", "market": "NYSE", "quantity": 150, "average_cost": 195.40, 
++                        "current_price": 218.65, "market_value": 32797.50, "cost_basis": 29310.00
++                    }
++                ]
++                
++                for holding in demo_holdings:
++                    unrealized_pnl = holding["market_value"] - holding["cost_basis"]
++                    unrealized_pnl_percent = (unrealized_pnl / holding["cost_basis"]) * 100 if holding["cost_basis"] > 0 else 0
++                    day_change = holding["market_value"] * 0.0085
++                    day_change_percent = 0.85
++                    portfolio_percent = (holding["market_value"] / 125000.00) * 100
++                    
++                    await conn.execute("""
++                        INSERT INTO portfolio_holdings 
++                        (user_id, vault_id, symbol, asset_name, asset_class, sector, market,
++                         quantity, average_cost, current_price, market_value, cost_basis,
++                         unrealized_pnl, unrealized_pnl_percent, day_change, day_change_percent,
++                         portfolio_percent)
++                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
++                        ON CONFLICT (user_id, vault_id, symbol, broker_account) DO NOTHING
++                    """,
++                        user_id, vaultId, holding["symbol"], holding["asset_name"], 
++                        holding["asset_class"], holding["sector"], holding["market"],
++                        holding["quantity"], holding["average_cost"], holding["current_price"],
++                        holding["market_value"], holding["cost_basis"], unrealized_pnl,
++                        unrealized_pnl_percent, day_change, day_change_percent, portfolio_percent
++                    )
++                
++                results = await conn.fetch(f"""
++                    SELECT * FROM portfolio_holdings 
++                    {where_clause}
++                    ORDER BY market_value DESC
++                """, *params)
+             
+-            holding = PortfolioHolding(
+-                symbol=holding_data['symbol'],
+-                assetName=holding_data['asset_name'],
+-                assetClass=holding_data['asset_class'],
+-                sector=holding_data['sector'],
+-                market=holding_data['market'],
+-                quantity=holding_data['quantity'],
+-                averageCost=holding_data['average_cost'],
+-                currentPrice=holding_data['current_price'],
+-                marketValue=holding_data['market_value'],
+-                costBasis=holding_data['cost_basis'],
+-                unrealizedPnl=holding_data['unrealized_pnl'],
+-                unrealizedPnlPercent=holding_data['unrealized_pnl_percent'],
+-                dayChange=holding_data['day_change'],
+-                dayChangePercent=holding_data['day_change_percent'],
+-                portfolioPercent=holding_data['portfolio_percent'],
+-                brokerAccount=holding_data['broker_account'],
+-                lastUpdated=holding_data['last_updated']
+-            )
++            holdings = []
+             
+-            holdings.append(holding.dict())
+-        
+-        conn.close()
++            for row in results:
++                holding = PortfolioHolding(
++                    symbol=row['symbol'],
++                    assetName=row['asset_name'],
++                    assetClass=row['asset_class'],
++                    sector=row['sector'],
++                    market=row['market'],
++                    quantity=row['quantity'],
++                    averageCost=row['average_cost'],
++                    currentPrice=row['current_price'],
++                    marketValue=row['market_value'],
++                    costBasis=row['cost_basis'],
++                    unrealizedPnl=row['unrealized_pnl'],
++                    unrealizedPnlPercent=row['unrealized_pnl_percent'],
++                    dayChange=row['day_change'],
++                    dayChangePercent=row['day_change_percent'],
++                    portfolioPercent=row['portfolio_percent'],
++                    brokerAccount=row['broker_account'],
++                    lastUpdated=row['last_updated'].isoformat() if hasattr(row['last_updated'], 'isoformat') else str(row['last_updated'])
++                )
++                
++                holdings.append(holding.dict())
+         
+         await log_to_agent_memory(
+             user_id,
+@@ -418,41 +325,38 @@ async def get_portfolio_holdings(
+ @router.post("/portfolio/refresh")
+ async def refresh_portfolio_data(
+     vaultId: Optional[str] = None,
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Refresh portfolio data from all connected sources"""
+     try:
+-        # This would normally trigger data refresh from brokers/exchanges
+-        # For now, we'll update the last_updated timestamp
+-        
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        where_clause = "WHERE userId = ?"
+-        params = [user_id, datetime.now().isoformat()]
+-        
+-        if vaultId:
+-            where_clause += " AND vaultId = ?"
+-            params.insert(-1, vaultId)
+-        else:
+-            where_clause += " AND vaultId IS NULL"
+-        
+-        # Update summary
+-        cursor.execute(f"""
+-            UPDATE PortfolioSummary 
+-            SET last_updated = ?
+-            {where_clause}
+-        """, params)
+-        
+-        # Update holdings
+-        cursor.execute(f"""
+-            UPDATE PortfolioHoldings 
+-            SET last_updated = ?
+-            {where_clause}
+-        """, params)
+-        
+-        conn.commit()
+-        conn.close()
++        async with get_db_connection() as conn:
++            where_clause = "WHERE user_id = $1"
++            timestamp = datetime.now()
++            
++            if vaultId:
++                await conn.execute(f"""
++                    UPDATE portfolio_summary 
++                    SET last_updated = $2
++                    WHERE user_id = $1 AND vault_id = $3
++                """, user_id, timestamp, vaultId)
++                
++                await conn.execute(f"""
++                    UPDATE portfolio_holdings 
++                    SET last_updated = $2
++                    WHERE user_id = $1 AND vault_id = $3
++                """, user_id, timestamp, vaultId)
++            else:
++                await conn.execute(f"""
++                    UPDATE portfolio_summary 
++                    SET last_updated = $2
++                    WHERE user_id = $1 AND vault_id IS NULL
++                """, user_id, timestamp)
++                
++                await conn.execute(f"""
++                    UPDATE portfolio_holdings 
++                    SET last_updated = $2
++                    WHERE user_id = $1 AND vault_id IS NULL
++                """, user_id, timestamp)
+         
+         await log_to_agent_memory(
+             user_id,
+@@ -460,13 +364,13 @@ async def refresh_portfolio_data(
+             f"Refreshed portfolio data",
+             json.dumps({"vaultId": vaultId}),
+             "Portfolio data refresh completed",
+-            {"vaultId": vaultId, "refresh_time": datetime.now().isoformat()}
++            {"vaultId": vaultId, "refresh_time": timestamp.isoformat()}
+         )
+         
+         return {
+             "success": True,
+             "message": "Portfolio data refreshed successfully",
+-            "refreshedAt": datetime.now().isoformat()
++            "refreshedAt": timestamp.isoformat()
+         }
+         
+     except Exception as e:
+@@ -489,7 +393,7 @@ async def get_combined_portfolio():
+ @router.get("/portfolio/snapshot")
+ async def get_portfolio_snapshot(
+     vaultId: Optional[str] = Query(None),
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Get portfolio snapshot with allocation and overlay data"""
+     try:
+@@ -544,7 +448,7 @@ async def get_portfolio_snapshot(
+ async def get_portfolio_performance(
+     vaultId: Optional[str] = Query(None),
+     timeRange: str = Query("7d", description="Time range: 7d or 30d"),
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Get portfolio performance history"""
+     try:
+@@ -588,7 +492,7 @@ async def get_portfolio_performance(
+ @router.get("/strategy/overlays")
+ async def get_strategy_overlays(
+     vaultId: Optional[str] = Query(None),
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Get strategy overlay state"""
+     try:
+@@ -636,7 +540,7 @@ async def get_strategy_overlays(
+ @router.get("/portfolio/rebalance-recommendations")
+ async def get_rebalance_recommendations(
+     vaultId: Optional[str] = Query(None),
+-    user_id: int = 1  # TODO: Get from authentication
++    user_id: str = "1"
+ ):
+     """Get portfolio rebalance recommendations"""
+     try:
+@@ -686,4 +590,4 @@ async def get_rebalance_recommendations(
+         }
+         
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e)) 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=str(e))            
+\ No newline at end of file
+-- 
+2.34.1
+
+
+From 0616189201ac294bd0b0c34670e3cca8faf2aafc Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 23:02:46 +0000
+Subject: [PATCH 6/7] feat: Migrate watchlist routes to async PostgreSQL
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/routes/watchlist.py | 639 +++++++++++++++----------------------
+ 1 file changed, 251 insertions(+), 388 deletions(-)
+
+diff --git a/server/routes/watchlist.py b/server/routes/watchlist.py
+index 110e809..161b334 100644
+--- a/server/routes/watchlist.py
++++ b/server/routes/watchlist.py
+@@ -2,10 +2,9 @@ from fastapi import APIRouter, HTTPException, Query
+ from typing import List, Optional, Dict, Any
+ from datetime import datetime
+ import json
+-import sqlite3
+-from pathlib import Path
+ import uuid
+ from pydantic import BaseModel, Field
++from database import get_db_connection
+ 
+ router = APIRouter()
+ 
+@@ -54,128 +53,61 @@ class SharedWatchlistResponse(BaseModel):
+     sharedAt: str
+     canEdit: bool
+ 
+-# Database connection
+-def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
+-
+-# Database operations
+-def create_watchlist_tables():
+-    """Create watchlist tables if they don't exist"""
+-    conn = get_db_connection()
+-    cursor = conn.cursor()
+-    
+-    # Create watchlists table
+-    cursor.execute("""
+-        CREATE TABLE IF NOT EXISTS watchlists (
+-            id TEXT PRIMARY KEY,
+-            name TEXT NOT NULL,
+-            description TEXT,
+-            owner_id TEXT NOT NULL,
+-            is_public BOOLEAN DEFAULT FALSE,
+-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+-        )
+-    """)
+-    
+-    # Create watchlist items table
+-    cursor.execute("""
+-        CREATE TABLE IF NOT EXISTS watchlist_items (
+-            id TEXT PRIMARY KEY,
+-            watchlist_id TEXT NOT NULL,
+-            symbol TEXT NOT NULL,
+-            name TEXT NOT NULL,
+-            price REAL NOT NULL,
+-            change_24h REAL DEFAULT 0,
+-            market_cap REAL,
+-            notes TEXT,
+-            added_at TEXT NOT NULL DEFAULT (datetime('now')),
+-            FOREIGN KEY (watchlist_id) REFERENCES watchlists (id) ON DELETE CASCADE
+-        )
+-    """)
+-    
+-    # Create watchlist shares table
+-    cursor.execute("""
+-        CREATE TABLE IF NOT EXISTS watchlist_shares (
+-            id TEXT PRIMARY KEY,
+-            watchlist_id TEXT NOT NULL,
+-            owner_id TEXT NOT NULL,
+-            shared_with_id TEXT NOT NULL,
+-            is_read_only BOOLEAN DEFAULT FALSE,
+-            shared_at TEXT NOT NULL DEFAULT (datetime('now')),
+-            FOREIGN KEY (watchlist_id) REFERENCES watchlists (id) ON DELETE CASCADE,
+-            UNIQUE(watchlist_id, shared_with_id)
+-        )
+-    """)
+-    
+-    conn.commit()
+-    conn.close()
+-
+-def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
++async def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
+     """Get watchlist by ID with permission check"""
+-    conn = get_db_connection()
+-    cursor = conn.cursor()
+-    
+-    # Check if user owns the watchlist or has access to it
+-    cursor.execute("""
+-        SELECT w.*, 
+-               (CASE WHEN w.owner_id = ? THEN 1 ELSE 0 END) as is_owner,
+-               (CASE WHEN ws.is_read_only = 1 THEN 1 ELSE 0 END) as is_read_only
+-        FROM watchlists w
+-        LEFT JOIN watchlist_shares ws ON w.id = ws.watchlist_id AND ws.shared_with_id = ?
+-        WHERE w.id = ? AND (w.owner_id = ? OR ws.shared_with_id = ? OR w.is_public = 1)
+-    """, (user_id, user_id, watchlist_id, user_id, user_id))
+-    
+-    row = cursor.fetchone()
+-    if not row:
+-        conn.close()
+-        return None
+-    
+-    # Get watchlist items
+-    cursor.execute("""
+-        SELECT symbol, name, price, change_24h, market_cap, notes, added_at
+-        FROM watchlist_items
+-        WHERE watchlist_id = ?
+-        ORDER BY added_at DESC
+-    """, (watchlist_id,))
+-    
+-    items_data = cursor.fetchall()
+-    items = [
+-        WatchlistItem(
+-            symbol=item[0],
+-            name=item[1],
+-            price=item[2],
+-            change_24h=item[3],
+-            market_cap=item[4],
+-            notes=item[5],
+-            addedAt=item[6]
++    async with get_db_connection() as conn:
++        row = await conn.fetchrow("""
++            SELECT w.id, w.name, w.description, w.owner_id, w.is_public, w.created_at, w.updated_at,
++                   (CASE WHEN w.owner_id = $2 THEN 1 ELSE 0 END) as is_owner,
++                   (CASE WHEN ws.is_read_only = true THEN 1 ELSE 0 END) as is_read_only
++            FROM watchlists w
++            LEFT JOIN watchlist_shares ws ON w.id = ws.watchlist_id AND ws.shared_with_id = $2
++            WHERE w.id = $1 AND (w.owner_id = $2 OR ws.shared_with_id = $2 OR w.is_public = true)
++        """, watchlist_id, user_id)
++        
++        if not row:
++            return None
++        
++        items_data = await conn.fetch("""
++            SELECT symbol, name, price, change_24h, market_cap, notes, added_at
++            FROM watchlist_items
++            WHERE watchlist_id = $1
++            ORDER BY added_at DESC
++        """, watchlist_id)
++        
++        items = [
++            WatchlistItem(
++                symbol=item['symbol'],
++                name=item['name'],
++                price=item['price'],
++                change_24h=item['change_24h'],
++                market_cap=item['market_cap'],
++                notes=item['notes'],
++                addedAt=item['added_at'].isoformat() if hasattr(item['added_at'], 'isoformat') else str(item['added_at'])
++            )
++            for item in items_data
++        ]
++        
++        shared_data = await conn.fetch("""
++            SELECT shared_with_id
++            FROM watchlist_shares
++            WHERE watchlist_id = $1
++        """, watchlist_id)
++        
++        shared_with = [r['shared_with_id'] for r in shared_data]
++        
++        return Watchlist(
++            id=row['id'],
++            name=row['name'],
++            description=row['description'],
++            items=items,
++            ownerId=row['owner_id'],
++            sharedWith=shared_with,
++            isPublic=bool(row['is_public']),
++            isReadOnly=bool(row['is_read_only']) if row['is_owner'] == 0 else False,
++            createdAt=row['created_at'].isoformat() if hasattr(row['created_at'], 'isoformat') else str(row['created_at']),
++            updatedAt=row['updated_at'].isoformat() if hasattr(row['updated_at'], 'isoformat') else str(row['updated_at'])
+         )
+-        for item in items_data
+-    ]
+-    
+-    # Get shared users
+-    cursor.execute("""
+-        SELECT shared_with_id
+-        FROM watchlist_shares
+-        WHERE watchlist_id = ?
+-    """, (watchlist_id,))
+-    
+-    shared_with = [row[0] for row in cursor.fetchall()]
+-    
+-    conn.close()
+-    
+-    return Watchlist(
+-        id=row[0],
+-        name=row[1],
+-        description=row[2],
+-        items=items,
+-        ownerId=row[3],
+-        sharedWith=shared_with,
+-        isPublic=bool(row[4]),
+-        isReadOnly=bool(row[6]) if row[5] == 0 else False,  # Only read-only if not owner
+-        createdAt=row[5],
+-        updatedAt=row[6]
+-    )
+ 
+ # API Endpoints
+ @router.get("/watchlist")
+@@ -185,55 +117,48 @@ async def get_user_watchlists(
+ ):
+     """Get user's watchlists including owned and shared"""
+     try:
+-        create_watchlist_tables()
+-        
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Get owned watchlists
+-        cursor.execute("""
+-            SELECT id, name, description, owner_id, is_public, created_at, updated_at
+-            FROM watchlists
+-            WHERE owner_id = ?
+-            ORDER BY updated_at DESC
+-        """, (user_id,))
+-        
+-        owned_watchlists = []
+-        for row in cursor.fetchall():
+-            watchlist = get_watchlist_by_id(row[0], user_id)
+-            if watchlist:
+-                owned_watchlists.append(watchlist.dict())
+-        
+-        result = {
+-            "owned": owned_watchlists,
+-            "shared": []
+-        }
+-        
+-        if include_shared:
+-            # Get shared watchlists
+-            cursor.execute("""
+-                SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
+-                       w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
+-                FROM watchlists w
+-                JOIN watchlist_shares ws ON w.id = ws.watchlist_id
+-                WHERE ws.shared_with_id = ?
+-                ORDER BY ws.shared_at DESC
+-            """, (user_id,))
++        async with get_db_connection() as conn:
++            owned_rows = await conn.fetch("""
++                SELECT id, name, description, owner_id, is_public, created_at, updated_at
++                FROM watchlists
++                WHERE owner_id = $1
++                ORDER BY updated_at DESC
++            """, user_id)
+             
+-            shared_watchlists = []
+-            for row in cursor.fetchall():
+-                watchlist = get_watchlist_by_id(row[0], user_id)
++            owned_watchlists = []
++            for row in owned_rows:
++                watchlist = await get_watchlist_by_id(row['id'], user_id)
+                 if watchlist:
+-                    shared_watchlists.append({
+-                        "watchlist": watchlist.dict(),
+-                        "sharedBy": row[3],
+-                        "sharedAt": row[7],
+-                        "canEdit": not bool(row[8])
+-                    })
++                    owned_watchlists.append(watchlist.dict())
+             
+-            result["shared"] = shared_watchlists
++            result = {
++                "owned": owned_watchlists,
++                "shared": []
++            }
++            
++            if include_shared:
++                shared_rows = await conn.fetch("""
++                    SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
++                           w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
++                    FROM watchlists w
++                    JOIN watchlist_shares ws ON w.id = ws.watchlist_id
++                    WHERE ws.shared_with_id = $1
++                    ORDER BY ws.shared_at DESC
++                """, user_id)
++                
++                shared_watchlists = []
++                for row in shared_rows:
++                    watchlist = await get_watchlist_by_id(row['id'], user_id)
++                    if watchlist:
++                        shared_watchlists.append({
++                            "watchlist": watchlist.dict(),
++                            "sharedBy": row['owner_id'],
++                            "sharedAt": row['shared_at'].isoformat() if hasattr(row['shared_at'], 'isoformat') else str(row['shared_at']),
++                            "canEdit": not bool(row['is_read_only'])
++                        })
++                
++                result["shared"] = shared_watchlists
+         
+-        conn.close()
+         return result
+         
+     except Exception as e:
+@@ -246,52 +171,42 @@ async def create_watchlist(
+ ):
+     """Create a new watchlist"""
+     try:
+-        create_watchlist_tables()
+-        
+         watchlist_id = str(uuid.uuid4())
+-        created_at = datetime.now().isoformat()
+-        
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create watchlist
+-        cursor.execute("""
+-            INSERT INTO watchlists (id, name, description, owner_id, is_public, created_at, updated_at)
+-            VALUES (?, ?, ?, ?, ?, ?, ?)
+-        """, (
+-            watchlist_id,
+-            request.name,
+-            request.description,
+-            user_id,
+-            request.isPublic,
+-            created_at,
+-            created_at
+-        ))
+-        
+-        # Add items if provided
+-        for item in request.items:
+-            item_id = str(uuid.uuid4())
+-            cursor.execute("""
+-                INSERT INTO watchlist_items 
+-                (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-            """, (
+-                item_id,
++        created_at = datetime.now()
++        
++        async with get_db_connection() as conn:
++            await conn.execute("""
++                INSERT INTO watchlists (id, name, description, owner_id, is_public, created_at, updated_at)
++                VALUES ($1, $2, $3, $4, $5, $6, $7)
++            """,
+                 watchlist_id,
+-                item.symbol,
+-                item.name,
+-                item.price,
+-                item.change_24h,
+-                item.market_cap,
+-                item.notes,
+-                item.addedAt
+-            ))
+-        
+-        conn.commit()
+-        conn.close()
+-        
+-        # Return created watchlist
+-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
++                request.name,
++                request.description,
++                user_id,
++                request.isPublic,
++                created_at,
++                created_at
++            )
++            
++            for item in request.items:
++                item_id = str(uuid.uuid4())
++                await conn.execute("""
++                    INSERT INTO watchlist_items 
++                    (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
++                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
++                """,
++                    item_id,
++                    watchlist_id,
++                    item.symbol,
++                    item.name,
++                    item.price,
++                    item.change_24h,
++                    item.market_cap,
++                    item.notes,
++                    datetime.fromisoformat(item.addedAt) if isinstance(item.addedAt, str) else item.addedAt
++                )
++        
++        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         return watchlist.dict() if watchlist else None
+         
+     except Exception as e:
+@@ -305,75 +220,65 @@ async def update_watchlist(
+ ):
+     """Update a watchlist"""
+     try:
+-        create_watchlist_tables()
+-        
+-        # Check if user has edit permission
+-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
++        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         if not watchlist:
+             raise HTTPException(status_code=404, detail="Watchlist not found")
+         
+         if watchlist.ownerId != user_id and watchlist.isReadOnly:
+             raise HTTPException(status_code=403, detail="No permission to edit this watchlist")
+         
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Update watchlist
+-        update_fields = []
+-        update_values = []
+-        
+-        if request.name is not None:
+-            update_fields.append("name = ?")
+-            update_values.append(request.name)
+-        
+-        if request.description is not None:
+-            update_fields.append("description = ?")
+-            update_values.append(request.description)
+-        
+-        if request.isPublic is not None:
+-            update_fields.append("is_public = ?")
+-            update_values.append(request.isPublic)
+-        
+-        if update_fields:
+-            update_fields.append("updated_at = ?")
+-            update_values.append(datetime.now().isoformat())
+-            update_values.append(watchlist_id)
++        async with get_db_connection() as conn:
++            update_fields = []
++            param_idx = 2
++            params = [watchlist_id]
+             
+-            cursor.execute(f"""
+-                UPDATE watchlists 
+-                SET {', '.join(update_fields)}
+-                WHERE id = ?
+-            """, update_values)
+-        
+-        # Update items if provided
+-        if request.items is not None:
+-            # Delete existing items
+-            cursor.execute("DELETE FROM watchlist_items WHERE watchlist_id = ?", (watchlist_id,))
++            if request.name is not None:
++                update_fields.append(f"name = ${param_idx}")
++                params.append(request.name)
++                param_idx += 1
+             
+-            # Add new items
+-            for item in request.items:
+-                item_id = str(uuid.uuid4())
+-                cursor.execute("""
+-                    INSERT INTO watchlist_items 
+-                    (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
+-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-                """, (
+-                    item_id,
+-                    watchlist_id,
+-                    item.symbol,
+-                    item.name,
+-                    item.price,
+-                    item.change_24h,
+-                    item.market_cap,
+-                    item.notes,
+-                    item.addedAt
+-                ))
+-        
+-        conn.commit()
+-        conn.close()
+-        
+-        # Return updated watchlist
+-        updated_watchlist = get_watchlist_by_id(watchlist_id, user_id)
++            if request.description is not None:
++                update_fields.append(f"description = ${param_idx}")
++                params.append(request.description)
++                param_idx += 1
++            
++            if request.isPublic is not None:
++                update_fields.append(f"is_public = ${param_idx}")
++                params.append(request.isPublic)
++                param_idx += 1
++            
++            if update_fields:
++                update_fields.append(f"updated_at = ${param_idx}")
++                params.append(datetime.now())
++                
++                await conn.execute(f"""
++                    UPDATE watchlists 
++                    SET {', '.join(update_fields)}
++                    WHERE id = $1
++                """, *params)
++            
++            if request.items is not None:
++                await conn.execute("DELETE FROM watchlist_items WHERE watchlist_id = $1", watchlist_id)
++                
++                for item in request.items:
++                    item_id = str(uuid.uuid4())
++                    await conn.execute("""
++                        INSERT INTO watchlist_items 
++                        (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
++                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
++                    """,
++                        item_id,
++                        watchlist_id,
++                        item.symbol,
++                        item.name,
++                        item.price,
++                        item.change_24h,
++                        item.market_cap,
++                        item.notes,
++                        datetime.fromisoformat(item.addedAt) if isinstance(item.addedAt, str) else item.addedAt
++                    )
++        
++        updated_watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         return updated_watchlist.dict() if updated_watchlist else None
+         
+     except HTTPException:
+@@ -388,24 +293,15 @@ async def delete_watchlist(
+ ):
+     """Delete a watchlist"""
+     try:
+-        create_watchlist_tables()
+-        
+-        # Check if user owns the watchlist
+-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
++        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         if not watchlist:
+             raise HTTPException(status_code=404, detail="Watchlist not found")
+         
+         if watchlist.ownerId != user_id:
+             raise HTTPException(status_code=403, detail="Only the owner can delete this watchlist")
+         
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Delete watchlist (items and shares will be deleted by CASCADE)
+-        cursor.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+-        
+-        conn.commit()
+-        conn.close()
++        async with get_db_connection() as conn:
++            await conn.execute("DELETE FROM watchlists WHERE id = $1", watchlist_id)
+         
+         return {"message": "Watchlist deleted successfully"}
+         
+@@ -421,51 +317,41 @@ async def share_watchlist(
+ ):
+     """Share a watchlist with another user"""
+     try:
+-        create_watchlist_tables()
+-        
+-        # Check if user owns the watchlist
+-        watchlist = get_watchlist_by_id(request.watchlistId, user_id)
++        watchlist = await get_watchlist_by_id(request.watchlistId, user_id)
+         if not watchlist:
+             raise HTTPException(status_code=404, detail="Watchlist not found")
+         
+         if watchlist.ownerId != user_id:
+             raise HTTPException(status_code=403, detail="Only the owner can share this watchlist")
+         
+-        # Check if already shared with this user
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            SELECT id FROM watchlist_shares
+-            WHERE watchlist_id = ? AND shared_with_id = ?
+-        """, (request.watchlistId, request.recipientId))
+-        
+-        if cursor.fetchone():
+-            raise HTTPException(status_code=400, detail="Watchlist already shared with this user")
+-        
+-        # Create share record
+-        share_id = str(uuid.uuid4())
+-        shared_at = datetime.now().isoformat()
+-        
+-        cursor.execute("""
+-            INSERT INTO watchlist_shares (id, watchlist_id, owner_id, shared_with_id, is_read_only, shared_at)
+-            VALUES (?, ?, ?, ?, ?, ?)
+-        """, (
+-            share_id,
+-            request.watchlistId,
+-            user_id,
+-            request.recipientId,
+-            request.readOnly,
+-            shared_at
+-        ))
+-        
+-        conn.commit()
+-        conn.close()
++        async with get_db_connection() as conn:
++            existing = await conn.fetchrow("""
++                SELECT id FROM watchlist_shares
++                WHERE watchlist_id = $1 AND shared_with_id = $2
++            """, request.watchlistId, request.recipientId)
++            
++            if existing:
++                raise HTTPException(status_code=400, detail="Watchlist already shared with this user")
++            
++            share_id = str(uuid.uuid4())
++            shared_at = datetime.now()
++            
++            await conn.execute("""
++                INSERT INTO watchlist_shares (id, watchlist_id, owner_id, shared_with_id, is_read_only, shared_at)
++                VALUES ($1, $2, $3, $4, $5, $6)
++            """,
++                share_id,
++                request.watchlistId,
++                user_id,
++                request.recipientId,
++                request.readOnly,
++                shared_at
++            )
+         
+         return {
+             "message": "Watchlist shared successfully",
+             "shareId": share_id,
+-            "sharedAt": shared_at,
++            "sharedAt": shared_at.isoformat(),
+             "readOnly": request.readOnly
+         }
+         
+@@ -481,32 +367,27 @@ async def get_shared_watchlists(
+ ):
+     """Get all watchlists shared with a user"""
+     try:
+-        create_watchlist_tables()
+-        
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
+-                   w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
+-            FROM watchlists w
+-            JOIN watchlist_shares ws ON w.id = ws.watchlist_id
+-            WHERE ws.shared_with_id = ?
+-            ORDER BY ws.shared_at DESC
+-        """, (user_id,))
+-        
+-        shared_watchlists = []
+-        for row in cursor.fetchall():
+-            watchlist = get_watchlist_by_id(row[0], user_id)
+-            if watchlist:
+-                shared_watchlists.append({
+-                    "watchlist": watchlist.dict(),
+-                    "sharedBy": row[3],
+-                    "sharedAt": row[7],
+-                    "canEdit": not bool(row[8])
+-                })
++        async with get_db_connection() as conn:
++            rows = await conn.fetch("""
++                SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
++                       w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
++                FROM watchlists w
++                JOIN watchlist_shares ws ON w.id = ws.watchlist_id
++                WHERE ws.shared_with_id = $1
++                ORDER BY ws.shared_at DESC
++            """, user_id)
++            
++            shared_watchlists = []
++            for row in rows:
++                watchlist = await get_watchlist_by_id(row['id'], user_id)
++                if watchlist:
++                    shared_watchlists.append({
++                        "watchlist": watchlist.dict(),
++                        "sharedBy": row['owner_id'],
++                        "sharedAt": row['shared_at'].isoformat() if hasattr(row['shared_at'], 'isoformat') else str(row['shared_at']),
++                        "canEdit": not bool(row['is_read_only'])
++                    })
+         
+-        conn.close()
+         return shared_watchlists
+         
+     except Exception as e:
+@@ -520,30 +401,21 @@ async def unshare_watchlist(
+ ):
+     """Remove sharing access for a watchlist"""
+     try:
+-        create_watchlist_tables()
+-        
+-        # Check if user owns the watchlist
+-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
++        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         if not watchlist:
+             raise HTTPException(status_code=404, detail="Watchlist not found")
+         
+         if watchlist.ownerId != user_id:
+             raise HTTPException(status_code=403, detail="Only the owner can unshare this watchlist")
+         
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Remove share record
+-        cursor.execute("""
+-            DELETE FROM watchlist_shares
+-            WHERE watchlist_id = ? AND shared_with_id = ?
+-        """, (watchlist_id, recipient_id))
+-        
+-        if cursor.rowcount == 0:
+-            raise HTTPException(status_code=404, detail="Share record not found")
+-        
+-        conn.commit()
+-        conn.close()
++        async with get_db_connection() as conn:
++            result = await conn.execute("""
++                DELETE FROM watchlist_shares
++                WHERE watchlist_id = $1 AND shared_with_id = $2
++            """, watchlist_id, recipient_id)
++            
++            if result == "DELETE 0":
++                raise HTTPException(status_code=404, detail="Share record not found")
+         
+         return {"message": "Watchlist unshared successfully"}
+         
+@@ -559,9 +431,7 @@ async def get_watchlist(
+ ):
+     """Get a specific watchlist"""
+     try:
+-        create_watchlist_tables()
+-        
+-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
++        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         if not watchlist:
+             raise HTTPException(status_code=404, detail="Watchlist not found or access denied")
+         
+@@ -579,31 +449,24 @@ async def get_watchlist_permissions(
+ ):
+     """Get permissions for a watchlist"""
+     try:
+-        create_watchlist_tables()
+-        
+-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
++        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
+         if not watchlist:
+             raise HTTPException(status_code=404, detail="Watchlist not found or access denied")
+         
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Get all shares for this watchlist
+-        cursor.execute("""
+-            SELECT shared_with_id, is_read_only, shared_at
+-            FROM watchlist_shares
+-            WHERE watchlist_id = ?
+-        """, (watchlist_id,))
+-        
+-        shares = []
+-        for row in cursor.fetchall():
+-            shares.append({
+-                "userId": row[0],
+-                "readOnly": bool(row[1]),
+-                "sharedAt": row[2]
+-            })
+-        
+-        conn.close()
++        async with get_db_connection() as conn:
++            rows = await conn.fetch("""
++                SELECT shared_with_id, is_read_only, shared_at
++                FROM watchlist_shares
++                WHERE watchlist_id = $1
++            """, watchlist_id)
++            
++            shares = []
++            for row in rows:
++                shares.append({
++                    "userId": row['shared_with_id'],
++                    "readOnly": bool(row['is_read_only']),
++                    "sharedAt": row['shared_at'].isoformat() if hasattr(row['shared_at'], 'isoformat') else str(row['shared_at'])
++                })
+         
+         return {
+             "watchlistId": watchlist_id,
+@@ -621,4 +484,4 @@ async def get_watchlist_permissions(
+     except HTTPException:
+         raise
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=f"Failed to get permissions: {str(e)}") 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=f"Failed to get permissions: {str(e)}")        
+\ No newline at end of file
+-- 
+2.34.1
+
+
+From 3dcc58540f51f1986fc48ae44384e7912241e58f Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 23:02:46 +0000
+Subject: [PATCH 7/7] feat: Migrate rebalance scheduler routes to async
+ PostgreSQL
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/routes/rebalance_scheduler.py | 550 +++++++++++----------------
+ 1 file changed, 223 insertions(+), 327 deletions(-)
+
+diff --git a/server/routes/rebalance_scheduler.py b/server/routes/rebalance_scheduler.py
+index 79d2152..855cf85 100644
+--- a/server/routes/rebalance_scheduler.py
++++ b/server/routes/rebalance_scheduler.py
+@@ -3,8 +3,7 @@ from pydantic import BaseModel
+ from typing import Optional, List, Dict, Any
+ import json
+ from datetime import datetime, timedelta
+-import sqlite3
+-from pathlib import Path
++from database import get_db_connection
+ 
+ router = APIRouter()
+ 
+@@ -12,7 +11,7 @@ router = APIRouter()
+ # UI for scheduling rebalances: Daily, Weekly, Monthly with threshold controls
+ 
+ class RebalanceSchedule(BaseModel):
+-    userId: int
++    userId: str
+     enabled: bool = True
+     frequency: str  # "daily", "weekly", "monthly", "quarterly", "manual"
+     threshold: float = 5.0  # Only rebalance if allocation drifts more than this %
+@@ -27,7 +26,7 @@ class RebalanceSchedule(BaseModel):
+     nextScheduledTime: Optional[str] = None
+ 
+ class RebalanceExecution(BaseModel):
+-    userId: int
++    userId: str
+     scheduleId: int
+     executionType: str  # "scheduled", "manual", "threshold_triggered"
+     portfolioValueBefore: float
+@@ -36,40 +35,28 @@ class RebalanceExecution(BaseModel):
+     completedSuccessfully: bool
+     errorMessage: Optional[str] = None
+ 
+-# Database connection
+-def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
+-
+-# Agent Memory logging
+-async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
++async def log_to_agent_memory(user_id: str, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            INSERT INTO AgentMemory 
+-            (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-        """, (
+-            user_id,
+-            "block_9",
+-            action_type,
+-            action_summary,
+-            input_data,
+-            output_data,
+-            json.dumps(metadata) if metadata else None,
+-            datetime.now().isoformat(),
+-            f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+-        ))
+-        
+-        conn.commit()
+-        conn.close()
+-        
++        async with get_db_connection() as conn:
++            await conn.execute("""
++                INSERT INTO agent_memory 
++                (user_id, block_id, action, context, user_input, agent_response, metadata, timestamp, session_id)
++                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
++            """,
++                user_id,
++                "block_9",
++                action_type,
++                action_summary,
++                input_data,
++                output_data,
++                json.dumps(metadata) if metadata else None,
++                datetime.now(),
++                f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
++            )
+     except Exception as e:
+         print(f"Failed to log to agent memory: {e}")
+ 
+-def calculate_next_scheduled_time(schedule: RebalanceSchedule) -> str:
++def calculate_next_scheduled_time(schedule: RebalanceSchedule) -> Optional[str]:
+     """Calculate next scheduled rebalance time"""
+     now = datetime.now()
+     
+@@ -130,72 +117,41 @@ def calculate_next_scheduled_time(schedule: RebalanceSchedule) -> str:
+     return next_time.isoformat()
+ 
+ @router.get("/rebalance/schedule/{user_id}")
+-async def get_rebalance_schedule(user_id: int):
++async def get_rebalance_schedule(user_id: str):
+     """Get rebalance schedule for a user"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create RebalanceSchedule table if it doesn't exist
+-        cursor.execute("""
+-            CREATE TABLE IF NOT EXISTS RebalanceSchedule (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                userId INTEGER NOT NULL,
+-                enabled BOOLEAN NOT NULL DEFAULT 1,
+-                frequency TEXT NOT NULL DEFAULT 'manual',
+-                threshold REAL NOT NULL DEFAULT 5.0,
+-                onlyIfThresholdsExceeded BOOLEAN NOT NULL DEFAULT 1,
+-                dayOfWeek INTEGER,
+-                dayOfMonth INTEGER,
+-                excludeWeekends BOOLEAN NOT NULL DEFAULT 1,
+-                allowPartialRebalancing BOOLEAN NOT NULL DEFAULT 0,
+-                maxTradesPerSession INTEGER NOT NULL DEFAULT 10,
+-                timeOfDay TEXT NOT NULL DEFAULT '09:30',
+-                lastRebalanceTime TEXT,
+-                nextScheduledTime TEXT,
+-                createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                FOREIGN KEY (userId) REFERENCES User (id)
+-            )
+-        """)
+-        
+-        cursor.execute("""
+-            SELECT * FROM RebalanceSchedule 
+-            WHERE userId = ?
+-            ORDER BY createdAt DESC
+-            LIMIT 1
+-        """, (user_id,))
+-        
+-        result = cursor.fetchone()
+-        
+-        if result:
+-            columns = [description[0] for description in cursor.description]
+-            schedule = dict(zip(columns, result))
+-        else:
+-            # Create default schedule
+-            schedule = {
+-                "userId": user_id,
+-                "enabled": False,
+-                "frequency": "manual",
+-                "threshold": 5.0,
+-                "onlyIfThresholdsExceeded": True,
+-                "dayOfWeek": None,
+-                "dayOfMonth": None,
+-                "excludeWeekends": True,
+-                "allowPartialRebalancing": False,
+-                "maxTradesPerSession": 10,
+-                "timeOfDay": "09:30",
+-                "lastRebalanceTime": None,
+-                "nextScheduledTime": None
+-            }
+-        
+-        conn.close()
++        async with get_db_connection() as conn:
++            result = await conn.fetchrow("""
++                SELECT * FROM rebalance_schedules 
++                WHERE user_id = $1
++                ORDER BY created_at DESC
++                LIMIT 1
++            """, user_id)
++            
++            if result:
++                schedule = dict(result)
++            else:
++                schedule = {
++                    "userId": user_id,
++                    "enabled": False,
++                    "frequency": "manual",
++                    "threshold": 5.0,
++                    "onlyIfThresholdsExceeded": True,
++                    "dayOfWeek": None,
++                    "dayOfMonth": None,
++                    "excludeWeekends": True,
++                    "allowPartialRebalancing": False,
++                    "maxTradesPerSession": 10,
++                    "timeOfDay": "09:30",
++                    "lastRebalanceTime": None,
++                    "nextScheduledTime": None
++                }
+         
+         await log_to_agent_memory(
+             user_id,
+             "rebalance_schedule_retrieved",
+             f"Retrieved rebalance schedule for user",
+-            None,
++            "",
+             f"Schedule found: {schedule.get('frequency', 'manual')} frequency",
+             {"frequency": schedule.get("frequency"), "enabled": schedule.get("enabled")}
+         )
+@@ -209,58 +165,48 @@ async def get_rebalance_schedule(user_id: int):
+ async def save_rebalance_schedule(schedule: RebalanceSchedule):
+     """Save or update rebalance schedule"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Calculate next scheduled time
+         next_scheduled = calculate_next_scheduled_time(schedule)
+         
+-        # Check if schedule exists
+-        cursor.execute("""
+-            SELECT id FROM RebalanceSchedule 
+-            WHERE userId = ?
+-        """, (schedule.userId,))
+-        
+-        existing = cursor.fetchone()
+-        
+-        if existing:
+-            # Update existing
+-            cursor.execute("""
+-                UPDATE RebalanceSchedule 
+-                SET enabled = ?, frequency = ?, threshold = ?, 
+-                    onlyIfThresholdsExceeded = ?, dayOfWeek = ?, dayOfMonth = ?,
+-                    excludeWeekends = ?, allowPartialRebalancing = ?, 
+-                    maxTradesPerSession = ?, timeOfDay = ?, nextScheduledTime = ?,
+-                    updatedAt = ?
+-                WHERE userId = ?
+-            """, (
+-                schedule.enabled, schedule.frequency, schedule.threshold,
+-                schedule.onlyIfThresholdsExceeded, schedule.dayOfWeek, schedule.dayOfMonth,
+-                schedule.excludeWeekends, schedule.allowPartialRebalancing,
+-                schedule.maxTradesPerSession, schedule.timeOfDay, next_scheduled,
+-                datetime.now().isoformat(), schedule.userId
+-            ))
+-            action = "updated"
+-            schedule_id = existing[0]
+-        else:
+-            # Create new
+-            cursor.execute("""
+-                INSERT INTO RebalanceSchedule 
+-                (userId, enabled, frequency, threshold, onlyIfThresholdsExceeded,
+-                 dayOfWeek, dayOfMonth, excludeWeekends, allowPartialRebalancing,
+-                 maxTradesPerSession, timeOfDay, nextScheduledTime)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-            """, (
+-                schedule.userId, schedule.enabled, schedule.frequency, schedule.threshold,
+-                schedule.onlyIfThresholdsExceeded, schedule.dayOfWeek, schedule.dayOfMonth,
+-                schedule.excludeWeekends, schedule.allowPartialRebalancing,
+-                schedule.maxTradesPerSession, schedule.timeOfDay, next_scheduled
+-            ))
+-            action = "created"
+-            schedule_id = cursor.lastrowid
+-        
+-        conn.commit()
+-        conn.close()
++        async with get_db_connection() as conn:
++            existing = await conn.fetchrow("""
++                SELECT id FROM rebalance_schedules 
++                WHERE user_id = $1
++            """, schedule.userId)
++            
++            if existing:
++                await conn.execute("""
++                    UPDATE rebalance_schedules 
++                    SET enabled = $1, frequency = $2, threshold = $3, 
++                        only_if_thresholds_exceeded = $4, day_of_week = $5, day_of_month = $6,
++                        exclude_weekends = $7, allow_partial_rebalancing = $8,
++                        max_trades_per_session = $9, time_of_day = $10, next_scheduled_time = $11,
++                        updated_at = $12
++                    WHERE user_id = $13
++                """,
++                    schedule.enabled, schedule.frequency, schedule.threshold,
++                    schedule.onlyIfThresholdsExceeded, schedule.dayOfWeek, schedule.dayOfMonth,
++                    schedule.excludeWeekends, schedule.allowPartialRebalancing,
++                    schedule.maxTradesPerSession, schedule.timeOfDay, next_scheduled,
++                    datetime.now(), schedule.userId
++                )
++                action = "updated"
++                schedule_id = existing['id']
++            else:
++                result = await conn.fetchrow("""
++                    INSERT INTO rebalance_schedules 
++                    (user_id, enabled, frequency, threshold, only_if_thresholds_exceeded,
++                     day_of_week, day_of_month, exclude_weekends, allow_partial_rebalancing,
++                     max_trades_per_session, time_of_day, next_scheduled_time)
++                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
++                    RETURNING id
++                """,
++                    schedule.userId, schedule.enabled, schedule.frequency, schedule.threshold,
++                    schedule.onlyIfThresholdsExceeded, schedule.dayOfWeek, schedule.dayOfMonth,
++                    schedule.excludeWeekends, schedule.allowPartialRebalancing,
++                    schedule.maxTradesPerSession, schedule.timeOfDay, next_scheduled
++                )
++                action = "created"
++                schedule_id = result['id']
+         
+         await log_to_agent_memory(
+             schedule.userId,
+@@ -288,108 +234,73 @@ async def save_rebalance_schedule(schedule: RebalanceSchedule):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.post("/rebalance/trigger/{user_id}")
+-async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
++async def trigger_rebalance(user_id: str, execution_type: str = "manual"):
+     """Trigger a manual rebalance"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Create RebalanceExecution table if it doesn't exist
+-        cursor.execute("""
+-            CREATE TABLE IF NOT EXISTS RebalanceExecution (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                userId INTEGER NOT NULL,
+-                scheduleId INTEGER,
+-                executionType TEXT NOT NULL,
+-                portfolioValueBefore REAL NOT NULL,
+-                totalDriftPercent REAL NOT NULL,
+-                tradesExecuted INTEGER NOT NULL DEFAULT 0,
+-                completedSuccessfully BOOLEAN NOT NULL DEFAULT 0,
+-                errorMessage TEXT,
+-                executedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                FOREIGN KEY (userId) REFERENCES User (id),
+-                FOREIGN KEY (scheduleId) REFERENCES RebalanceSchedule (id)
+-            )
+-        """)
+-        
+-        # Get current portfolio positions to calculate drift
+-        cursor.execute("""
+-            SELECT 
+-                assetClass,
+-                SUM(quantity * currentPrice) as totalValue
+-            FROM PortfolioPosition 
+-            WHERE userId = ?
+-            GROUP BY assetClass
+-        """, (user_id,))
+-        
+-        positions = cursor.fetchall()
+-        if not positions:
+-            raise HTTPException(status_code=400, detail="No positions found for rebalancing")
+-        
+-        # Calculate total portfolio value
+-        total_value = sum(pos[1] for pos in positions)
+-        
+-        # Get target allocations (simplified - using equal weighting for demo)
+-        target_allocation = 1.0 / len(positions)  # Equal weight
+-        
+-        # Calculate drift
+-        max_drift = 0.0
+-        for asset_class, value in positions:
+-            current_allocation = value / total_value
+-            drift = abs(current_allocation - target_allocation)
+-            max_drift = max(max_drift, drift * 100)  # Convert to percentage
+-        
+-        # Get schedule to check thresholds
+-        cursor.execute("""
+-            SELECT threshold, onlyIfThresholdsExceeded, id FROM RebalanceSchedule 
+-            WHERE userId = ?
+-        """, (user_id,))
+-        
+-        schedule_data = cursor.fetchone()
+-        threshold = schedule_data[0] if schedule_data else 5.0
+-        only_if_exceeded = schedule_data[1] if schedule_data else True
+-        schedule_id = schedule_data[2] if schedule_data else None
+-        
+-        # Check if rebalancing is needed
+-        rebalance_needed = not only_if_exceeded or max_drift > threshold
+-        
+-        if not rebalance_needed:
+-            return {
+-                "success": False,
+-                "message": f"Rebalancing not needed. Max drift {max_drift:.2f}% is below threshold {threshold}%",
+-                "portfolioValue": total_value,
+-                "maxDrift": max_drift,
+-                "threshold": threshold
+-            }
+-        
+-        # Simulate rebalancing trades
+-        import random
+-        trades_executed = random.randint(1, len(positions))
+-        success = random.random() > 0.1  # 90% success rate
+-        
+-        error_message = None if success else "Simulated trade execution error"
+-        
+-        # Record execution
+-        cursor.execute("""
+-            INSERT INTO RebalanceExecution 
+-            (userId, scheduleId, executionType, portfolioValueBefore, 
+-             totalDriftPercent, tradesExecuted, completedSuccessfully, errorMessage)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+-        """, (user_id, schedule_id, execution_type, total_value, max_drift,
+-              trades_executed, success, error_message))
+-        
+-        execution_id = cursor.lastrowid
+-        
+-        # Update last rebalance time if successful
+-        if success and schedule_id:
+-            cursor.execute("""
+-                UPDATE RebalanceSchedule 
+-                SET lastRebalanceTime = ?, updatedAt = ?
+-                WHERE id = ?
+-            """, (datetime.now().isoformat(), datetime.now().isoformat(), schedule_id))
+-        
+-        conn.commit()
+-        conn.close()
++        async with get_db_connection() as conn:
++            positions = await conn.fetch("""
++                SELECT 
++                    asset_class,
++                    SUM(quantity * current_price) as total_value
++                FROM portfolio_positions 
++                WHERE user_id = $1
++                GROUP BY asset_class
++            """, user_id)
++            
++            if not positions:
++                raise HTTPException(status_code=400, detail="No positions found for rebalancing")
++            
++            total_value = sum(float(pos['total_value']) for pos in positions)
++            target_allocation = 1.0 / len(positions)
++            
++            max_drift = 0.0
++            for pos in positions:
++                current_allocation = float(pos['total_value']) / total_value
++                drift = abs(current_allocation - target_allocation)
++                max_drift = max(max_drift, drift * 100)
++            
++            schedule_data = await conn.fetchrow("""
++                SELECT threshold, only_if_thresholds_exceeded, id FROM rebalance_schedules 
++                WHERE user_id = $1
++            """, user_id)
++            
++            threshold = float(schedule_data['threshold']) if schedule_data else 5.0
++            only_if_exceeded = bool(schedule_data['only_if_thresholds_exceeded']) if schedule_data else True
++            schedule_id = schedule_data['id'] if schedule_data else None
++            
++            rebalance_needed = not only_if_exceeded or max_drift > threshold
++            
++            if not rebalance_needed:
++                return {
++                    "success": False,
++                    "message": f"Rebalancing not needed. Max drift {max_drift:.2f}% is below threshold {threshold}%",
++                    "portfolioValue": total_value,
++                    "maxDrift": max_drift,
++                    "threshold": threshold
++                }
++            
++            import random
++            trades_executed = random.randint(1, len(positions))
++            success = random.random() > 0.1
++            error_message = None if success else "Simulated trade execution error"
++            
++            result = await conn.fetchrow("""
++                INSERT INTO rebalance_executions 
++                (user_id, schedule_id, execution_type, portfolio_value_before, 
++                 total_drift_percent, trades_executed, completed_successfully, error_message)
++                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
++                RETURNING id
++            """, user_id, schedule_id, execution_type, total_value, max_drift,
++                trades_executed, success, error_message)
++            
++            execution_id = result['id']
++            
++            if success and schedule_id:
++                await conn.execute("""
++                    UPDATE rebalance_schedules 
++                    SET last_rebalance_time = $1, updated_at = $2
++                    WHERE id = $3
++                """, datetime.now(), datetime.now(), schedule_id)
+         
+         await log_to_agent_memory(
+             user_id,
+@@ -423,32 +334,26 @@ async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/rebalance/history/{user_id}")
+-async def get_rebalance_history(user_id: int, limit: int = 20):
++async def get_rebalance_history(user_id: str, limit: int = 20):
+     """Get rebalance execution history"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        cursor.execute("""
+-            SELECT 
+-                re.*,
+-                rs.frequency as scheduleFrequency
+-            FROM RebalanceExecution re
+-            LEFT JOIN RebalanceSchedule rs ON re.scheduleId = rs.id
+-            WHERE re.userId = ?
+-            ORDER BY re.executedAt DESC
+-            LIMIT ?
+-        """, (user_id, limit))
+-        
+-        columns = [description[0] for description in cursor.description]
+-        history = [dict(zip(columns, row)) for row in cursor.fetchall()]
+-        
+-        # Calculate summary statistics
+-        total_executions = len(history)
+-        successful_executions = len([h for h in history if h['completedSuccessfully']])
+-        avg_trades = sum(h['tradesExecuted'] for h in history) / total_executions if total_executions > 0 else 0
+-        
+-        conn.close()
++        async with get_db_connection() as conn:
++            rows = await conn.fetch("""
++                SELECT 
++                    re.*,
++                    rs.frequency as schedule_frequency
++                FROM rebalance_executions re
++                LEFT JOIN rebalance_schedules rs ON re.schedule_id = rs.id
++                WHERE re.user_id = $1
++                ORDER BY re.executed_at DESC
++                LIMIT $2
++            """, user_id, limit)
++            
++            history = [dict(row) for row in rows]
++            
++            total_executions = len(history)
++            successful_executions = len([h for h in history if h.get('completed_successfully')])
++            avg_trades = sum(h.get('trades_executed', 0) for h in history) / total_executions if total_executions > 0 else 0
+         
+         return {
+             "history": history,
+@@ -464,67 +369,58 @@ async def get_rebalance_history(user_id: int, limit: int = 20):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/rebalance/status/{user_id}")
+-async def get_rebalance_status(user_id: int):
++async def get_rebalance_status(user_id: str):
+     """Get current rebalance status and drift analysis"""
+     try:
+-        conn = get_db_connection()
+-        cursor = conn.cursor()
+-        
+-        # Get current positions
+-        cursor.execute("""
+-            SELECT 
+-                symbol, assetClass, quantity, currentPrice,
+-                (quantity * currentPrice) as marketValue
+-            FROM PortfolioPosition 
+-            WHERE userId = ?
+-        """, (user_id,))
+-        
+-        positions = cursor.fetchall()
+-        if not positions:
+-            return {"needsRebalancing": False, "message": "No positions found"}
+-        
+-        # Calculate current allocations
+-        total_value = sum(pos[4] for pos in positions)
+-        asset_classes = {}
+-        
+-        for symbol, asset_class, quantity, price, market_value in positions:
+-            if asset_class not in asset_classes:
+-                asset_classes[asset_class] = {"value": 0, "symbols": []}
+-            asset_classes[asset_class]["value"] += market_value
+-            asset_classes[asset_class]["symbols"].append(symbol)
+-        
+-        # Calculate allocations and drift (using equal weight target for demo)
+-        target_allocation = 1.0 / len(asset_classes)
+-        max_drift = 0.0
+-        allocation_analysis = []
+-        
+-        for asset_class, data in asset_classes.items():
+-            current_allocation = data["value"] / total_value
+-            drift = abs(current_allocation - target_allocation)
+-            max_drift = max(max_drift, drift)
++        async with get_db_connection() as conn:
++            positions = await conn.fetch("""
++                SELECT 
++                    symbol, asset_class, quantity, current_price,
++                    (quantity * current_price) as market_value
++                FROM portfolio_positions 
++                WHERE user_id = $1
++            """, user_id)
+             
+-            allocation_analysis.append({
+-                "assetClass": asset_class,
+-                "currentAllocation": current_allocation * 100,
+-                "targetAllocation": target_allocation * 100,
+-                "drift": drift * 100,
+-                "value": data["value"],
+-                "symbols": data["symbols"]
+-            })
+-        
+-        # Get threshold from schedule
+-        cursor.execute("""
+-            SELECT threshold, nextScheduledTime FROM RebalanceSchedule 
+-            WHERE userId = ?
+-        """, (user_id,))
+-        
+-        schedule_data = cursor.fetchone()
+-        threshold = schedule_data[0] if schedule_data else 5.0
+-        next_scheduled = schedule_data[1] if schedule_data else None
+-        
+-        needs_rebalancing = (max_drift * 100) > threshold
+-        
+-        conn.close()
++            if not positions:
++                return {"needsRebalancing": False, "message": "No positions found"}
++            
++            total_value = sum(float(pos['market_value']) for pos in positions)
++            asset_classes = {}
++            
++            for pos in positions:
++                asset_class = pos['asset_class']
++                if asset_class not in asset_classes:
++                    asset_classes[asset_class] = {"value": 0, "symbols": []}
++                asset_classes[asset_class]["value"] += float(pos['market_value'])
++                asset_classes[asset_class]["symbols"].append(pos['symbol'])
++            
++            target_allocation = 1.0 / len(asset_classes)
++            max_drift = 0.0
++            allocation_analysis = []
++            
++            for asset_class, data in asset_classes.items():
++                current_allocation = data["value"] / total_value
++                drift = abs(current_allocation - target_allocation)
++                max_drift = max(max_drift, drift)
++                
++                allocation_analysis.append({
++                    "assetClass": asset_class,
++                    "currentAllocation": current_allocation * 100,
++                    "targetAllocation": target_allocation * 100,
++                    "drift": drift * 100,
++                    "value": data["value"],
++                    "symbols": data["symbols"]
++                })
++            
++            schedule_data = await conn.fetchrow("""
++                SELECT threshold, next_scheduled_time FROM rebalance_schedules 
++                WHERE user_id = $1
++            """, user_id)
++            
++            threshold = float(schedule_data['threshold']) if schedule_data else 5.0
++            next_scheduled = schedule_data['next_scheduled_time'] if schedule_data else None
++            
++            needs_rebalancing = (max_drift * 100) > threshold
+         
+         return {
+             "needsRebalancing": needs_rebalancing,
+@@ -532,9 +428,9 @@ async def get_rebalance_status(user_id: int):
+             "threshold": threshold,
+             "totalPortfolioValue": total_value,
+             "allocationAnalysis": allocation_analysis,
+-            "nextScheduledRebalance": next_scheduled,
++            "nextScheduledRebalance": next_scheduled.isoformat() if hasattr(next_scheduled, 'isoformat') else str(next_scheduled) if next_scheduled else None,
+             "lastAnalyzed": datetime.now().isoformat()
+         }
+         
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e)) 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=str(e))        
+\ No newline at end of file
+-- 
+2.34.1
+

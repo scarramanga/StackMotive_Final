@@ -1,5 +1,25 @@
 version: '3.8'
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: stackmotive-postgres
+    environment:
+      - POSTGRES_DB=stackmotive
+      - POSTGRES_USER=stackmotive
+      - POSTGRES_PASSWORD=stackmotive
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./server/database/schemas:/docker-entrypoint-initdb.d
+    networks:
+      - stackmotive-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stackmotive"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   frontend:
     build:
       context: .
@@ -7,7 +27,10 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
     environment:
       - REACT_APP_API_URL=http://localhost:8000
     networks:
@@ -19,8 +42,11 @@ services:
       dockerfile: docker/backend.Dockerfile
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      - DATABASE_URL=sqlite:///./stackmotive.db
+      - DATABASE_URL=postgresql://stackmotive:stackmotive@postgres:5432/stackmotive
       - SECRET_KEY=your-secret-key-here
       - CORS_ORIGINS=http://localhost:3000
     volumes:
@@ -32,3 +58,6 @@ services:
 networks:
   stackmotive-network:
     driver: bridge
+
+volumes:
+  postgres_data:

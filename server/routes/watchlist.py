@@ -2,10 +2,9 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
-import sqlite3
-from pathlib import Path
 import uuid
 from pydantic import BaseModel, Field
+from database import get_db_connection
 
 router = APIRouter()
 
@@ -54,128 +53,61 @@ class SharedWatchlistResponse(BaseModel):
     sharedAt: str
     canEdit: bool
 
-# Database connection
-def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
-
-# Database operations
-def create_watchlist_tables():
-    """Create watchlist tables if they don't exist"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Create watchlists table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS watchlists (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            owner_id TEXT NOT NULL,
-            is_public BOOLEAN DEFAULT FALSE,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    
-    # Create watchlist items table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist_items (
-            id TEXT PRIMARY KEY,
-            watchlist_id TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            name TEXT NOT NULL,
-            price REAL NOT NULL,
-            change_24h REAL DEFAULT 0,
-            market_cap REAL,
-            notes TEXT,
-            added_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (watchlist_id) REFERENCES watchlists (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Create watchlist shares table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist_shares (
-            id TEXT PRIMARY KEY,
-            watchlist_id TEXT NOT NULL,
-            owner_id TEXT NOT NULL,
-            shared_with_id TEXT NOT NULL,
-            is_read_only BOOLEAN DEFAULT FALSE,
-            shared_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (watchlist_id) REFERENCES watchlists (id) ON DELETE CASCADE,
-            UNIQUE(watchlist_id, shared_with_id)
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
-
-def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
+async def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
     """Get watchlist by ID with permission check"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Check if user owns the watchlist or has access to it
-    cursor.execute("""
-        SELECT w.*, 
-               (CASE WHEN w.owner_id = ? THEN 1 ELSE 0 END) as is_owner,
-               (CASE WHEN ws.is_read_only = 1 THEN 1 ELSE 0 END) as is_read_only
-        FROM watchlists w
-        LEFT JOIN watchlist_shares ws ON w.id = ws.watchlist_id AND ws.shared_with_id = ?
-        WHERE w.id = ? AND (w.owner_id = ? OR ws.shared_with_id = ? OR w.is_public = 1)
-    """, (user_id, user_id, watchlist_id, user_id, user_id))
-    
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        return None
-    
-    # Get watchlist items
-    cursor.execute("""
-        SELECT symbol, name, price, change_24h, market_cap, notes, added_at
-        FROM watchlist_items
-        WHERE watchlist_id = ?
-        ORDER BY added_at DESC
-    """, (watchlist_id,))
-    
-    items_data = cursor.fetchall()
-    items = [
-        WatchlistItem(
-            symbol=item[0],
-            name=item[1],
-            price=item[2],
-            change_24h=item[3],
-            market_cap=item[4],
-            notes=item[5],
-            addedAt=item[6]
+    async with get_db_connection() as conn:
+        row = await conn.fetchrow("""
+            SELECT w.id, w.name, w.description, w.owner_id, w.is_public, w.created_at, w.updated_at,
+                   (CASE WHEN w.owner_id = $2 THEN 1 ELSE 0 END) as is_owner,
+                   (CASE WHEN ws.is_read_only = true THEN 1 ELSE 0 END) as is_read_only
+            FROM watchlists w
+            LEFT JOIN watchlist_shares ws ON w.id = ws.watchlist_id AND ws.shared_with_id = $2
+            WHERE w.id = $1 AND (w.owner_id = $2 OR ws.shared_with_id = $2 OR w.is_public = true)
+        """, watchlist_id, user_id)
+        
+        if not row:
+            return None
+        
+        items_data = await conn.fetch("""
+            SELECT symbol, name, price, change_24h, market_cap, notes, added_at
+            FROM watchlist_items
+            WHERE watchlist_id = $1
+            ORDER BY added_at DESC
+        """, watchlist_id)
+        
+        items = [
+            WatchlistItem(
+                symbol=item['symbol'],
+                name=item['name'],
+                price=item['price'],
+                change_24h=item['change_24h'],
+                market_cap=item['market_cap'],
+                notes=item['notes'],
+                addedAt=item['added_at'].isoformat() if hasattr(item['added_at'], 'isoformat') else str(item['added_at'])
+            )
+            for item in items_data
+        ]
+        
+        shared_data = await conn.fetch("""
+            SELECT shared_with_id
+            FROM watchlist_shares
+            WHERE watchlist_id = $1
+        """, watchlist_id)
+        
+        shared_with = [r['shared_with_id'] for r in shared_data]
+        
+        return Watchlist(
+            id=row['id'],
+            name=row['name'],
+            description=row['description'],
+            items=items,
+            ownerId=row['owner_id'],
+            sharedWith=shared_with,
+            isPublic=bool(row['is_public']),
+            isReadOnly=bool(row['is_read_only']) if row['is_owner'] == 0 else False,
+            createdAt=row['created_at'].isoformat() if hasattr(row['created_at'], 'isoformat') else str(row['created_at']),
+            updatedAt=row['updated_at'].isoformat() if hasattr(row['updated_at'], 'isoformat') else str(row['updated_at'])
         )
-        for item in items_data
-    ]
-    
-    # Get shared users
-    cursor.execute("""
-        SELECT shared_with_id
-        FROM watchlist_shares
-        WHERE watchlist_id = ?
-    """, (watchlist_id,))
-    
-    shared_with = [row[0] for row in cursor.fetchall()]
-    
-    conn.close()
-    
-    return Watchlist(
-        id=row[0],
-        name=row[1],
-        description=row[2],
-        items=items,
-        ownerId=row[3],
-        sharedWith=shared_with,
-        isPublic=bool(row[4]),
-        isReadOnly=bool(row[6]) if row[5] == 0 else False,  # Only read-only if not owner
-        createdAt=row[5],
-        updatedAt=row[6]
-    )
 
 # API Endpoints
 @router.get("/watchlist")
@@ -185,55 +117,48 @@ async def get_user_watchlists(
 ):
     """Get user's watchlists including owned and shared"""
     try:
-        create_watchlist_tables()
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Get owned watchlists
-        cursor.execute("""
-            SELECT id, name, description, owner_id, is_public, created_at, updated_at
-            FROM watchlists
-            WHERE owner_id = ?
-            ORDER BY updated_at DESC
-        """, (user_id,))
-        
-        owned_watchlists = []
-        for row in cursor.fetchall():
-            watchlist = get_watchlist_by_id(row[0], user_id)
-            if watchlist:
-                owned_watchlists.append(watchlist.dict())
-        
-        result = {
-            "owned": owned_watchlists,
-            "shared": []
-        }
-        
-        if include_shared:
-            # Get shared watchlists
-            cursor.execute("""
-                SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
-                       w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
-                FROM watchlists w
-                JOIN watchlist_shares ws ON w.id = ws.watchlist_id
-                WHERE ws.shared_with_id = ?
-                ORDER BY ws.shared_at DESC
-            """, (user_id,))
+        async with get_db_connection() as conn:
+            owned_rows = await conn.fetch("""
+                SELECT id, name, description, owner_id, is_public, created_at, updated_at
+                FROM watchlists
+                WHERE owner_id = $1
+                ORDER BY updated_at DESC
+            """, user_id)
             
-            shared_watchlists = []
-            for row in cursor.fetchall():
-                watchlist = get_watchlist_by_id(row[0], user_id)
+            owned_watchlists = []
+            for row in owned_rows:
+                watchlist = await get_watchlist_by_id(row['id'], user_id)
                 if watchlist:
-                    shared_watchlists.append({
-                        "watchlist": watchlist.dict(),
-                        "sharedBy": row[3],
-                        "sharedAt": row[7],
-                        "canEdit": not bool(row[8])
-                    })
+                    owned_watchlists.append(watchlist.dict())
             
-            result["shared"] = shared_watchlists
+            result = {
+                "owned": owned_watchlists,
+                "shared": []
+            }
+            
+            if include_shared:
+                shared_rows = await conn.fetch("""
+                    SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
+                           w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
+                    FROM watchlists w
+                    JOIN watchlist_shares ws ON w.id = ws.watchlist_id
+                    WHERE ws.shared_with_id = $1
+                    ORDER BY ws.shared_at DESC
+                """, user_id)
+                
+                shared_watchlists = []
+                for row in shared_rows:
+                    watchlist = await get_watchlist_by_id(row['id'], user_id)
+                    if watchlist:
+                        shared_watchlists.append({
+                            "watchlist": watchlist.dict(),
+                            "sharedBy": row['owner_id'],
+                            "sharedAt": row['shared_at'].isoformat() if hasattr(row['shared_at'], 'isoformat') else str(row['shared_at']),
+                            "canEdit": not bool(row['is_read_only'])
+                        })
+                
+                result["shared"] = shared_watchlists
         
-        conn.close()
         return result
         
     except Exception as e:
@@ -246,52 +171,42 @@ async def create_watchlist(
 ):
     """Create a new watchlist"""
     try:
-        create_watchlist_tables()
-        
         watchlist_id = str(uuid.uuid4())
-        created_at = datetime.now().isoformat()
+        created_at = datetime.now()
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Create watchlist
-        cursor.execute("""
-            INSERT INTO watchlists (id, name, description, owner_id, is_public, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            watchlist_id,
-            request.name,
-            request.description,
-            user_id,
-            request.isPublic,
-            created_at,
-            created_at
-        ))
-        
-        # Add items if provided
-        for item in request.items:
-            item_id = str(uuid.uuid4())
-            cursor.execute("""
-                INSERT INTO watchlist_items 
-                (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                item_id,
+        async with get_db_connection() as conn:
+            await conn.execute("""
+                INSERT INTO watchlists (id, name, description, owner_id, is_public, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
                 watchlist_id,
-                item.symbol,
-                item.name,
-                item.price,
-                item.change_24h,
-                item.market_cap,
-                item.notes,
-                item.addedAt
-            ))
+                request.name,
+                request.description,
+                user_id,
+                request.isPublic,
+                created_at,
+                created_at
+            )
+            
+            for item in request.items:
+                item_id = str(uuid.uuid4())
+                await conn.execute("""
+                    INSERT INTO watchlist_items 
+                    (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                    item_id,
+                    watchlist_id,
+                    item.symbol,
+                    item.name,
+                    item.price,
+                    item.change_24h,
+                    item.market_cap,
+                    item.notes,
+                    datetime.fromisoformat(item.addedAt) if isinstance(item.addedAt, str) else item.addedAt
+                )
         
-        conn.commit()
-        conn.close()
-        
-        # Return created watchlist
-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         return watchlist.dict() if watchlist else None
         
     except Exception as e:
@@ -305,75 +220,65 @@ async def update_watchlist(
 ):
     """Update a watchlist"""
     try:
-        create_watchlist_tables()
-        
-        # Check if user has edit permission
-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         if not watchlist:
             raise HTTPException(status_code=404, detail="Watchlist not found")
         
         if watchlist.ownerId != user_id and watchlist.isReadOnly:
             raise HTTPException(status_code=403, detail="No permission to edit this watchlist")
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Update watchlist
-        update_fields = []
-        update_values = []
-        
-        if request.name is not None:
-            update_fields.append("name = ?")
-            update_values.append(request.name)
-        
-        if request.description is not None:
-            update_fields.append("description = ?")
-            update_values.append(request.description)
-        
-        if request.isPublic is not None:
-            update_fields.append("is_public = ?")
-            update_values.append(request.isPublic)
-        
-        if update_fields:
-            update_fields.append("updated_at = ?")
-            update_values.append(datetime.now().isoformat())
-            update_values.append(watchlist_id)
+        async with get_db_connection() as conn:
+            update_fields = []
+            param_idx = 2
+            params = [watchlist_id]
             
-            cursor.execute(f"""
-                UPDATE watchlists 
-                SET {', '.join(update_fields)}
-                WHERE id = ?
-            """, update_values)
-        
-        # Update items if provided
-        if request.items is not None:
-            # Delete existing items
-            cursor.execute("DELETE FROM watchlist_items WHERE watchlist_id = ?", (watchlist_id,))
+            if request.name is not None:
+                update_fields.append(f"name = ${param_idx}")
+                params.append(request.name)
+                param_idx += 1
             
-            # Add new items
-            for item in request.items:
-                item_id = str(uuid.uuid4())
-                cursor.execute("""
-                    INSERT INTO watchlist_items 
-                    (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    item_id,
-                    watchlist_id,
-                    item.symbol,
-                    item.name,
-                    item.price,
-                    item.change_24h,
-                    item.market_cap,
-                    item.notes,
-                    item.addedAt
-                ))
+            if request.description is not None:
+                update_fields.append(f"description = ${param_idx}")
+                params.append(request.description)
+                param_idx += 1
+            
+            if request.isPublic is not None:
+                update_fields.append(f"is_public = ${param_idx}")
+                params.append(request.isPublic)
+                param_idx += 1
+            
+            if update_fields:
+                update_fields.append(f"updated_at = ${param_idx}")
+                params.append(datetime.now())
+                
+                await conn.execute(f"""
+                    UPDATE watchlists 
+                    SET {', '.join(update_fields)}
+                    WHERE id = $1
+                """, *params)
+            
+            if request.items is not None:
+                await conn.execute("DELETE FROM watchlist_items WHERE watchlist_id = $1", watchlist_id)
+                
+                for item in request.items:
+                    item_id = str(uuid.uuid4())
+                    await conn.execute("""
+                        INSERT INTO watchlist_items 
+                        (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                        item_id,
+                        watchlist_id,
+                        item.symbol,
+                        item.name,
+                        item.price,
+                        item.change_24h,
+                        item.market_cap,
+                        item.notes,
+                        datetime.fromisoformat(item.addedAt) if isinstance(item.addedAt, str) else item.addedAt
+                    )
         
-        conn.commit()
-        conn.close()
-        
-        # Return updated watchlist
-        updated_watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        updated_watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         return updated_watchlist.dict() if updated_watchlist else None
         
     except HTTPException:
@@ -388,24 +293,15 @@ async def delete_watchlist(
 ):
     """Delete a watchlist"""
     try:
-        create_watchlist_tables()
-        
-        # Check if user owns the watchlist
-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         if not watchlist:
             raise HTTPException(status_code=404, detail="Watchlist not found")
         
         if watchlist.ownerId != user_id:
             raise HTTPException(status_code=403, detail="Only the owner can delete this watchlist")
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Delete watchlist (items and shares will be deleted by CASCADE)
-        cursor.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
-        
-        conn.commit()
-        conn.close()
+        async with get_db_connection() as conn:
+            await conn.execute("DELETE FROM watchlists WHERE id = $1", watchlist_id)
         
         return {"message": "Watchlist deleted successfully"}
         
@@ -421,51 +317,41 @@ async def share_watchlist(
 ):
     """Share a watchlist with another user"""
     try:
-        create_watchlist_tables()
-        
-        # Check if user owns the watchlist
-        watchlist = get_watchlist_by_id(request.watchlistId, user_id)
+        watchlist = await get_watchlist_by_id(request.watchlistId, user_id)
         if not watchlist:
             raise HTTPException(status_code=404, detail="Watchlist not found")
         
         if watchlist.ownerId != user_id:
             raise HTTPException(status_code=403, detail="Only the owner can share this watchlist")
         
-        # Check if already shared with this user
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id FROM watchlist_shares
-            WHERE watchlist_id = ? AND shared_with_id = ?
-        """, (request.watchlistId, request.recipientId))
-        
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Watchlist already shared with this user")
-        
-        # Create share record
-        share_id = str(uuid.uuid4())
-        shared_at = datetime.now().isoformat()
-        
-        cursor.execute("""
-            INSERT INTO watchlist_shares (id, watchlist_id, owner_id, shared_with_id, is_read_only, shared_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            share_id,
-            request.watchlistId,
-            user_id,
-            request.recipientId,
-            request.readOnly,
-            shared_at
-        ))
-        
-        conn.commit()
-        conn.close()
+        async with get_db_connection() as conn:
+            existing = await conn.fetchrow("""
+                SELECT id FROM watchlist_shares
+                WHERE watchlist_id = $1 AND shared_with_id = $2
+            """, request.watchlistId, request.recipientId)
+            
+            if existing:
+                raise HTTPException(status_code=400, detail="Watchlist already shared with this user")
+            
+            share_id = str(uuid.uuid4())
+            shared_at = datetime.now()
+            
+            await conn.execute("""
+                INSERT INTO watchlist_shares (id, watchlist_id, owner_id, shared_with_id, is_read_only, shared_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+                share_id,
+                request.watchlistId,
+                user_id,
+                request.recipientId,
+                request.readOnly,
+                shared_at
+            )
         
         return {
             "message": "Watchlist shared successfully",
             "shareId": share_id,
-            "sharedAt": shared_at,
+            "sharedAt": shared_at.isoformat(),
             "readOnly": request.readOnly
         }
         
@@ -481,32 +367,27 @@ async def get_shared_watchlists(
 ):
     """Get all watchlists shared with a user"""
     try:
-        create_watchlist_tables()
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
+                SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
+                       w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
+                FROM watchlists w
+                JOIN watchlist_shares ws ON w.id = ws.watchlist_id
+                WHERE ws.shared_with_id = $1
+                ORDER BY ws.shared_at DESC
+            """, user_id)
+            
+            shared_watchlists = []
+            for row in rows:
+                watchlist = await get_watchlist_by_id(row['id'], user_id)
+                if watchlist:
+                    shared_watchlists.append({
+                        "watchlist": watchlist.dict(),
+                        "sharedBy": row['owner_id'],
+                        "sharedAt": row['shared_at'].isoformat() if hasattr(row['shared_at'], 'isoformat') else str(row['shared_at']),
+                        "canEdit": not bool(row['is_read_only'])
+                    })
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT w.id, w.name, w.description, w.owner_id, w.is_public, 
-                   w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
-            FROM watchlists w
-            JOIN watchlist_shares ws ON w.id = ws.watchlist_id
-            WHERE ws.shared_with_id = ?
-            ORDER BY ws.shared_at DESC
-        """, (user_id,))
-        
-        shared_watchlists = []
-        for row in cursor.fetchall():
-            watchlist = get_watchlist_by_id(row[0], user_id)
-            if watchlist:
-                shared_watchlists.append({
-                    "watchlist": watchlist.dict(),
-                    "sharedBy": row[3],
-                    "sharedAt": row[7],
-                    "canEdit": not bool(row[8])
-                })
-        
-        conn.close()
         return shared_watchlists
         
     except Exception as e:
@@ -520,30 +401,21 @@ async def unshare_watchlist(
 ):
     """Remove sharing access for a watchlist"""
     try:
-        create_watchlist_tables()
-        
-        # Check if user owns the watchlist
-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         if not watchlist:
             raise HTTPException(status_code=404, detail="Watchlist not found")
         
         if watchlist.ownerId != user_id:
             raise HTTPException(status_code=403, detail="Only the owner can unshare this watchlist")
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Remove share record
-        cursor.execute("""
-            DELETE FROM watchlist_shares
-            WHERE watchlist_id = ? AND shared_with_id = ?
-        """, (watchlist_id, recipient_id))
-        
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Share record not found")
-        
-        conn.commit()
-        conn.close()
+        async with get_db_connection() as conn:
+            result = await conn.execute("""
+                DELETE FROM watchlist_shares
+                WHERE watchlist_id = $1 AND shared_with_id = $2
+            """, watchlist_id, recipient_id)
+            
+            if result == "DELETE 0":
+                raise HTTPException(status_code=404, detail="Share record not found")
         
         return {"message": "Watchlist unshared successfully"}
         
@@ -559,9 +431,7 @@ async def get_watchlist(
 ):
     """Get a specific watchlist"""
     try:
-        create_watchlist_tables()
-        
-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         if not watchlist:
             raise HTTPException(status_code=404, detail="Watchlist not found or access denied")
         
@@ -579,31 +449,24 @@ async def get_watchlist_permissions(
 ):
     """Get permissions for a watchlist"""
     try:
-        create_watchlist_tables()
-        
-        watchlist = get_watchlist_by_id(watchlist_id, user_id)
+        watchlist = await get_watchlist_by_id(watchlist_id, user_id)
         if not watchlist:
             raise HTTPException(status_code=404, detail="Watchlist not found or access denied")
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Get all shares for this watchlist
-        cursor.execute("""
-            SELECT shared_with_id, is_read_only, shared_at
-            FROM watchlist_shares
-            WHERE watchlist_id = ?
-        """, (watchlist_id,))
-        
-        shares = []
-        for row in cursor.fetchall():
-            shares.append({
-                "userId": row[0],
-                "readOnly": bool(row[1]),
-                "sharedAt": row[2]
-            })
-        
-        conn.close()
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
+                SELECT shared_with_id, is_read_only, shared_at
+                FROM watchlist_shares
+                WHERE watchlist_id = $1
+            """, watchlist_id)
+            
+            shares = []
+            for row in rows:
+                shares.append({
+                    "userId": row['shared_with_id'],
+                    "readOnly": bool(row['is_read_only']),
+                    "sharedAt": row['shared_at'].isoformat() if hasattr(row['shared_at'], 'isoformat') else str(row['shared_at'])
+                })
         
         return {
             "watchlistId": watchlist_id,
@@ -621,4 +484,4 @@ async def get_watchlist_permissions(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get permissions: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Failed to get permissions: {str(e)}")        
