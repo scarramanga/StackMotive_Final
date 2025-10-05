@@ -1,0 +1,142 @@
+From 86dcb8e80dadcf08d4d3db912f0aa675a524b688 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 23:51:40 +0000
+Subject: [PATCH] feat: PostgreSQL foundation setup
+
+- Update SQLAlchemy configuration to use PostgreSQL with connection pooling
+- Add PostgreSQL service to docker-compose with health checks
+- Replace aiosqlite with asyncpg and psycopg2-binary in requirements
+- Create .env.development with PostgreSQL connection settings
+- Remove SQLite-specific check_same_thread parameter
+- Add persistent volume for PostgreSQL data
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ .env.development        | 21 +++++++++++++++++++++
+ docker-compose.yml      | 26 +++++++++++++++++++++++++-
+ server/database.py      | 12 ++++++++----
+ server/requirements.txt |  3 ++-
+ 4 files changed, 56 insertions(+), 6 deletions(-)
+ create mode 100644 .env.development
+
+diff --git a/.env.development b/.env.development
+new file mode 100644
+index 0000000..1844b6f
+--- /dev/null
++++ b/.env.development
+@@ -0,0 +1,21 @@
++# PostgreSQL Configuration for Development
++DB_HOST=localhost
++DB_PORT=5432
++DB_NAME=stackmotive
++DB_USER=postgres
++DB_PASSWORD=password
++DATABASE_URL=postgresql://postgres:password@localhost:5432/stackmotive
++
++# Connection Pool Settings
++DB_POOL_MIN_SIZE=10
++DB_POOL_MAX_SIZE=20
++DB_POOL_TIMEOUT=30
++
++# Application Settings
++ENVIRONMENT=development
++SECRET_KEY=your-secret-key-here
++CORS_ORIGINS=http://localhost:3000
++
++# API Settings
++API_HOST=0.0.0.0
++API_PORT=8000
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a0c0aae..e1728e1 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,5 +1,23 @@
+ version: '3.8'
+ services:
++  postgres:
++    image: postgres:15-alpine
++    environment:
++      POSTGRES_DB: stackmotive
++      POSTGRES_USER: postgres
++      POSTGRES_PASSWORD: password
++    volumes:
++      - postgres_data:/var/lib/postgresql/data
++    ports:
++      - "5432:5432"
++    networks:
++      - stackmotive-network
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U postgres"]
++      interval: 10s
++      timeout: 5s
++      retries: 5
++
+   frontend:
+     build:
+       context: .
+@@ -20,15 +38,21 @@ services:
+     ports:
+       - "8000:8000"
+     environment:
+-      - DATABASE_URL=sqlite:///./stackmotive.db
++      - DATABASE_URL=postgresql://postgres:password@postgres:5432/stackmotive
+       - SECRET_KEY=your-secret-key-here
+       - CORS_ORIGINS=http://localhost:3000
+     volumes:
+       - ./server:/app/server
+       - ./data:/app/data
++    depends_on:
++      postgres:
++        condition: service_healthy
+     networks:
+       - stackmotive-network
+ 
+ networks:
+   stackmotive-network:
+     driver: bridge
++
++volumes:
++  postgres_data:
+diff --git a/server/database.py b/server/database.py
+index ed36495..0cc58a3 100644
+--- a/server/database.py
++++ b/server/database.py
+@@ -3,13 +3,17 @@ from sqlalchemy.ext.declarative import declarative_base
+ from sqlalchemy.orm import sessionmaker
+ import os
+ 
+-# Use SQLite for development
+-SQLALCHEMY_DATABASE_URL = "sqlite:///./dev.db"
++SQLALCHEMY_DATABASE_URL = os.getenv(
++    "DATABASE_URL",
++    "postgresql://postgres:password@localhost:5432/stackmotive"
++)
+ 
+-# Create engine with SQLite support for async
++# Create engine with PostgreSQL connection pooling
+ engine = create_engine(
+     SQLALCHEMY_DATABASE_URL,
+-    connect_args={"check_same_thread": False}  # Needed for SQLite
++    pool_pre_ping=True,
++    pool_size=10,
++    max_overflow=20
+ )
+ 
+ # Create session factory
+diff --git a/server/requirements.txt b/server/requirements.txt
+index d1dae1e..07352e2 100644
+--- a/server/requirements.txt
++++ b/server/requirements.txt
+@@ -6,7 +6,8 @@ pydantic[email]==2.6.0
+ 
+ # Database
+ sqlalchemy==2.0.25
+-aiosqlite==0.19.0
++asyncpg==0.29.0
++psycopg2-binary==2.9.9
+ alembic==1.13.1
+ 
+ # Authentication & Security
+-- 
+2.34.1
+
