@@ -523,36 +523,36 @@ export class InstitutionalFlowTrackerService {
     
     return { riskLevel, factors, score: riskScore };
   }
-}
 
-// Agent memory logging
-async logAgentMemory(
-  action: 'flow_tracked' | 'flow_filtered' | 'flow_analyzed' | 'alert_configured' | 'flow_exported' | 'data_refreshed' | 'filter_changed' | 'flow_drilldown',
-  flowData: {
-    userId?: string;
-    vaultId?: string;
-    metadata?: Record<string, any>;
-  }
-): Promise<void> {
-  try {
-    const logData = {
-      action,
-      blockId: 'block-29-institutional-flow-tracker',
-      timestamp: new Date().toISOString(),
-      userId: flowData.userId,
-      vaultId: flowData.vaultId,
-      data: {
-        ...flowData.metadata
-      }
-    };
+  // Agent memory logging
+  async logAgentMemory(
+    action: 'flow_tracked' | 'flow_filtered' | 'flow_analyzed' | 'alert_configured' | 'flow_exported' | 'data_refreshed' | 'filter_changed' | 'flow_drilldown',
+    flowData: {
+      userId?: string;
+      vaultId?: string;
+      metadata?: Record<string, any>;
+    }
+  ): Promise<void> {
+    try {
+      const logData = {
+        action,
+        blockId: 'block-29-institutional-flow-tracker',
+        timestamp: new Date().toISOString(),
+        userId: flowData.userId,
+        vaultId: flowData.vaultId,
+        data: {
+          ...flowData.metadata
+        }
+      };
 
-    await fetch('/api/agent/log', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(logData)
-    });
-  } catch (error) {
-    console.warn('Failed to log agent memory:', error);
+      await fetch('/api/agent/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(logData)
+      });
+    } catch (error) {
+      console.warn('Failed to log agent memory:', error);
+    }
   }
 }
 
@@ -614,4 +614,4 @@ export const useWatchlistFlowAnalysis = (symbols: string[], period: string = '7d
     queryFn: () => institutionalFlowTrackerService.getWatchlistFlowAnalysis(symbols, period),
     enabled: symbols.length > 0,
   });
-}; 
+};  
