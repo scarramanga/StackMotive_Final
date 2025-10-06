@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stack AI™ by StackMotive - Your Intelligence Edge in a Rigged Game</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: #0A0A0A;
+            color: #E8E8E8;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        /* Patent Badge */
+        .patent-badge {
+            background: rgba(255, 215, 0, 0.1);
+            color: #FFD700;
+            text-align: center;
+            padding: 12px 0;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(255, 215, 0, 0.2);
+        }
+        
+        /* Hero Section */
+        .hero {
+            background: linear-gradient(180deg, #0A0A0A 0%, #141414 100%);
+            padding: 80px 0 100px;
+            text-align: center;
+        }
+        
+        .logo {
+            color: #FFD700;
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: 2px;
+            margin-bottom: 20px;
+            text-shadow: 0 0 20px rgba(255, 215, 0, 0.3);
+        }
+        
+        .podcast-badge {
+            color: #A8A8A8;
+            font-size: 16px;
+            margin-bottom: 40px;
+        }
+        
+        .podcast-badge .gold {
+            color: #FFD700;
+            font-weight: 600;
+        }
+        
+        h1 {
+            font-size: 48px;
+            font-weight: 700;
+            line-height: 1.2;
+            margin-bottom: 24px;
+        }
+        
+        .gold {
+            color: #FFD700;
+        }
+        
+        .subheadline {
+            font-size: 24px;
+            color: #A8A8A8;
+            margin-bottom: 40px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .cta-button {
+            background: #FFD700;
+            color: #0A0A0A;
+            padding: 18px 40px;
+            font-size: 18px;
+            font-weight: 600;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            box-shadow: 0 4px 14px rgba(255, 215, 0, 0.3);
+            transition: all 0.2s;
+        }
+        
+        .cta-button:hover {
+            box-shadow: 0 6px 20px rgba(255, 215, 0, 0.4);
+            transform: translateY(-2px);
+        }
+        
+        .trust-points {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin-top: 60px;
+            flex-wrap: wrap;
+        }
+        
+        .trust-point {
+            color: #A8A8A8;
+            font-size: 16px;
+        }
+        
+        .check {
+            color: #00D970;
+            margin-right: 8px;
+        }
+        
+        /* Problem Section */
+        .problem {
+            background: #141414;
+            padding: 80px 0;
+            text-align: center;
+        }
+        
+        .section-title {
+            font-size: 40px;
+            margin-bottom: 24px;
+        }
+        
+        .section-text {
+            font-size: 20px;
+            color: #A8A8A8;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        /* Features Grid */
+        .features {
+            padding: 80px 0;
+            background: #0A0A0A;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+            margin-top: 60px;
+        }
+        
+        .feature-card {
+            background: #141414;
+            border: 1px solid #2A2A2A;
+            border-radius: 8px;
+            padding: 32px;
+            transition: all 0.3s;
+        }
+        
+        .feature-card:hover {
+            border-color: #FFD700;
+            box-shadow: 0 0 20px rgba(255, 215, 0, 0.1);
+        }
+        
+        .feature-title {
+            font-size: 24px;
+            margin-bottom: 16px;
+            color: #FFD700;
+        }
+        
+        .feature-text {
+            color: #A8A8A8;
+            line-height: 1.8;
+        }
+        
+        /* Patent Banner */
+        .patent-banner {
+            background: #FFD700;
+            color: #0A0A0A;
+            padding: 60px 0;
+            text-align: center;
+        }
+        
+        .patent-title {
+            font-size: 36px;
+            font-weight: 700;
+            margin-bottom: 16px;
+        }
+        
+        .patent-number {
+            font-size: 24px;
+            font-weight: 600;
+        }
+        
+        /* Beta Section */
+        .beta-section {
+            background: #141414;
+            padding: 80px 0;
+            text-align: center;
+        }
+        
+        .spots-remaining {
+            background: rgba(255, 51, 102, 0.1);
+            color: #FF3366;
+            display: inline-block;
+            padding: 8px 20px;
+            border-radius: 20px;
+            margin-bottom: 20px;
+            font-weight: 600;
+            font-size: 18px;
+        }
+        
+        .urgency-text {
+            color: #FFD700;
+            font-size: 16px;
+            margin-bottom: 40px;
+            font-weight: 600;
+        }
+        
+        .email-form {
+            max-width: 500px;
+            margin: 40px auto;
+            display: flex;
+            gap: 16px;
+        }
+        
+        .email-input {
+            flex: 1;
+            padding: 16px 20px;
+            background: #0A0A0A;
+            border: 1px solid #2A2A2A;
+            border-radius: 4px;
+            color: #E8E8E8;
+            font-size: 16px;
+        }
+        
+        .email-input:focus {
+            outline: none;
+            border-color: #FFD700;
+        }
+        
+        /* Waitlist Section */
+        .waitlist-section {
+            background: #0A0A0A;
+            padding: 80px 0;
+            text-align: center;
+            border-top: 1px solid #2A2A2A;
+        }
+        
+        /* Footer */
+        .footer {
+            background: #0A0A0A;
+            padding: 40px 0;
+            text-align: center;
+            color: #686868;
+            border-top: 1px solid #2A2A2A;
+        }
+        
+        .footer-link {
+            color: #FFD700;
+            text-decoration: none;
+        }
+        
+        .footer-link:hover {
+            text-decoration: underline;
+        }
+        
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 32px;
+            }
+            
+            .subheadline {
+                font-size: 20px;
+            }
+            
+            .section-title {
+                font-size: 28px;
+            }
+            
+            .trust-points {
+                flex-direction: column;
+                gap: 20px;
+            }
+            
+            .email-form {
+                flex-direction: column;
+            }
+            
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Patent Badge -->
+    <div class="patent-badge">
+        Patent Pending #823983 | Tier Tourism™ Technology
+    </div>
+    
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <div class="logo">STACKMOTIVE</div>
+            <div class="podcast-badge">From the creator of The Sovereign Signal podcast • <span class="gold">5,000+ listeners</span></div>
+            <h1>YOUR INTELLIGENCE EDGE<br>IN A <span class="gold">RIGGED GAME</span></h1>
+            <p class="subheadline">See what institutions see. Trade with conviction.<br>Build sovereign wealth.</p>
+            <a href="#beta-signup" class="cta-button">CLAIM YOUR EDGE →</a>
+            
+            <div class="trust-points">
+                <div class="trust-point"><span class="check">✓</span> 96 Intelligence Panels</div>
+                <div class="trust-point"><span class="check">✓</span> Real-time AI Analysis</div>
+                <div class="trust-point"><span class="check">✓</span> No Credit Card Required</div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Problem Section -->
+    <section class="problem">
+        <div class="container">
+            <h2 class="section-title">You're Trading <span class="gold">Blind</span></h2>
+            <p class="section-text">
+                While institutions pay $24,000/year for premium data terminals, you're stuck with delayed quotes and fragmented data. They see everything. You see crumbs. Until now.
+            </p>
+        </div>
+    </section>
+    
+    <!-- Features Section -->
+    <section class="features">
+        <div class="container">
+            <h2 class="section-title" style="text-align: center;">See Everything <span class="gold">They See</span></h2>
+            
+            <div class="features-grid">
+                <div class="feature-card">
+                    <h3 class="feature-title">96 Intelligence Panels</h3>
+                    <p class="feature-text">Every data source institutions use, organized in one sovereign interface. From options flow to dark pools, see the complete picture.</p>
+                </div>
+                
+                <div class="feature-card">
+                    <h3 class="feature-title">Stack AI™ Assistant</h3>
+                    <p class="feature-text">Ask questions in plain English. Get institutional-grade analysis instantly. No jargon, just actionable intelligence.</p>
+                </div>
+                
+                <div class="feature-card">
+                    <h3 class="feature-title">Tier Tourism™</h3>
+                    <p class="feature-text">Start at any tier, explore higher levels anytime. No limits, no friction. Patent-pending technology that grows with you.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Patent Banner -->
+    <section class="patent-banner">
+        <div class="container">
+            <h2 class="patent-title">Protected by Patent</h2>
+            <p class="patent-number">Application #823983 | Filed August 5, 2025</p>
+        </div>
+    </section>
+    
+    <!-- Beta Section -->
+    <section class="beta-section" id="beta-signup">
+        <div class="container">
+            <div class="spots-remaining">Only 37 Beta Spots Remaining</div>
+            <p class="urgency-text">13 spots claimed in the last 48 hours</p>
+            <h2 class="section-title">Claim Your <span class="gold">Sovereign Edge</span></h2>
+            <p class="section-text">Join 5,000+ sovereign investors who discovered us through The Sovereign Signal podcast.<br>Be among the first to access the platform they can't cancel.</p>
+            
+            <form class="email-form" action="https://formspree.io/f/xnnzgdqk" method="POST">
+                <input type="hidden" name="type" value="beta">
+                <input type="email" name="email" class="email-input" placeholder="Enter your email" required>
+                <button type="submit" class="cta-button">Get Beta Access</button>
+            </form>
+            
+            <p style="color: #686868; margin-top: 20px;">No spam. No credit card. Just sovereignty.</p>
+        </div>
+    </section>
+    
+    <!-- Waitlist Section -->
+    <section class="waitlist-section">
+        <div class="container">
+            <h2 class="section-title">Missed the Beta? <span class="gold">Join the Waitlist</span></h2>
+            <p class="section-text">Be first to know when we open more spots. Get exclusive updates and early access to launch.</p>
+            
+            <form class="email-form" action="https://formspree.io/f/xnnzgdqk" method="POST">
+                <input type="hidden" name="type" value="waitlist">
+                <input type="email" name="email" class="email-input" placeholder="Enter your email" required>
+                <button type="submit" class="cta-button" style="background: #2A2A2A; box-shadow: none;">Join Waitlist</button>
+            </form>
+        </div>
+    </section>
+    
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>© 2025 Sovereign Assets Ltd. All rights reserved. | <a href="https://sovereignsignal.com" class="footer-link" target="_blank">The Sovereign Signal Podcast</a></p>
+            <p style="margin-top: 10px;">Stack AI™ and Tier Tourism™ are trademarks of Sovereign Assets Ltd.</p>
+            <p style="margin-top: 10px;">Uncancellable. Unlimited. Unstoppable.</p>
+        </div>
+    </footer>
+</body>
+</html>
