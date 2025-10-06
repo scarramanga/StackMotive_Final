@@ -16,8 +16,10 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 import random
-from database import get_db_connection
 
 router = APIRouter()
 
@@ -70,104 +72,153 @@ class CombinedPortfolioResponse(BaseModel):
     combinedHoldings: List[CombinedHolding]
     totalValue: float
 
+# Database connection
+def get_db_connection():
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
+
 # Agent Memory logging
-async def log_to_agent_memory(user_id: str, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
+async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
     try:
-        async with get_db_connection() as conn:
-            await conn.execute("""
-                INSERT INTO agent_memory 
-                (user_id, block_id, action, context, user_input, agent_response, metadata, timestamp, session_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """,
-                user_id,
-                "block_04",
-                action_type,
-                action_summary,
-                input_data,
-                output_data,
-                json.dumps(metadata) if metadata else None,
-                datetime.now(),
-                f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO AgentMemory 
+            (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            user_id,
+            "block_04",
+            action_type,
+            action_summary,
+            input_data,
+            output_data,
+            json.dumps(metadata) if metadata else None,
+            datetime.now().isoformat(),
+            f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        ))
+        
+        conn.commit()
+        conn.close()
+        
     except Exception as e:
         print(f"Failed to log to agent memory: {e}")
 
 @router.get("/portfolio/summary")
 async def get_portfolio_summary(
     vaultId: Optional[str] = Query(None),
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Get portfolio summary data for dashboard"""
     try:
-        async with get_db_connection() as conn:
-            where_clause = "WHERE user_id = $1"
-            params = [user_id]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create portfolio summary table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS PortfolioSummary (
+                id SERIAL PRIMARY KEY,
+                userId INTEGER NOT NULL,
+                vaultId TEXT,
+                total_value REAL NOT NULL DEFAULT 0,
+                cash_balance REAL NOT NULL DEFAULT 0,
+                holdings_value REAL NOT NULL DEFAULT 0,
+                net_worth REAL NOT NULL DEFAULT 0,
+                change_value REAL DEFAULT 0,
+                change_percent REAL DEFAULT 0,
+                day_change_value REAL DEFAULT 0,
+                day_change_percent REAL DEFAULT 0,
+                total_return REAL DEFAULT 0,
+                total_return_percent REAL DEFAULT 0,
+                asset_count INTEGER DEFAULT 0,
+                last_updated TIMESTAMPTZ DEFAULT NOW(),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        
+        # Get existing summary or create default
+        where_clause = "WHERE userId = %s"
+        params = [user_id]
+        
+        if vaultId:
+            where_clause += " AND vaultId = %s"
+            params.append(vaultId)
+        else:
+            where_clause += " AND vaultId IS NULL"
+        
+        cursor.execute(f"""
+            SELECT * FROM PortfolioSummary 
+            {where_clause}
+            ORDER BY last_updated DESC 
+            LIMIT 1
+        """, params)
+        
+        result = cursor.fetchone()
+        
+        if not result:
+            # Create default summary with realistic demo data
+            total_value = 125000.00
+            holdings_value = 118500.00
+            cash_balance = 6500.00
+            net_worth = total_value
+            change_value = 2750.50
+            change_percent = 2.24
+            day_change_value = 1234.56
+            day_change_percent = 0.99
+            total_return = 18500.00
+            total_return_percent = 17.39
+            asset_count = 12
             
-            if vaultId:
-                where_clause += " AND vault_id = $2"
-                params.append(vaultId)
-            else:
-                where_clause += " AND vault_id IS NULL"
+            cursor.execute("""
+                INSERT INTO PortfolioSummary 
+                (userId, vaultId, total_value, cash_balance, holdings_value, net_worth,
+                 change_value, change_percent, day_change_value, day_change_percent,
+                 total_return, total_return_percent, asset_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                user_id, vaultId, total_value, cash_balance, holdings_value, net_worth,
+                change_value, change_percent, day_change_value, day_change_percent,
+                total_return, total_return_percent, asset_count
+            ))
             
-            result = await conn.fetchrow(f"""
-                SELECT * FROM portfolio_summary 
-                {where_clause}
-                ORDER BY last_updated DESC 
-                LIMIT 1
-            """, *params)
+            conn.commit()
             
-            if not result:
-                total_value = 125000.00
-                holdings_value = 118500.00
-                cash_balance = 6500.00
-                net_worth = total_value
-                change_value = 2750.50
-                change_percent = 2.24
-                day_change_value = 1234.56
-                day_change_percent = 0.99
-                total_return = 18500.00
-                total_return_percent = 17.39
-                asset_count = 12
-                
-                await conn.execute("""
-                    INSERT INTO portfolio_summary 
-                    (user_id, vault_id, portfolio_value, total_gain_loss, total_gain_loss_percent,
-                     day_gain_loss, day_gain_loss_percent, cash_balance, invested_amount, number_of_holdings)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                """,
-                    user_id, vaultId, total_value, change_value, change_percent,
-                    day_change_value, day_change_percent, cash_balance, holdings_value, asset_count
-                )
-                
-                summary = PortfolioSummary(
-                    totalValue=total_value,
-                    changePercent=change_percent,
-                    changeValue=change_value,
-                    netWorth=net_worth,
-                    assetCount=asset_count,
-                    dayChangeValue=day_change_value,
-                    dayChangePercent=day_change_percent,
-                    totalReturn=total_return,
-                    totalReturnPercent=total_return_percent,
-                    cashBalance=cash_balance,
-                    holdingsValue=holdings_value,
-                    lastUpdated=datetime.now().isoformat()
-                )
-            else:
-                summary = PortfolioSummary(
-                    totalValue=result['portfolio_value'],
-                    changePercent=result['total_gain_loss_percent'],
-                    changeValue=result['total_gain_loss'],
-                    netWorth=result['portfolio_value'],
-                    assetCount=result['number_of_holdings'],
-                    dayChangeValue=result['day_gain_loss'],
-                    dayChangePercent=result['day_gain_loss_percent'],
-                    totalReturn=result['total_gain_loss'],
-                    totalReturnPercent=result['total_gain_loss_percent'],
-                    cashBalance=result['cash_balance'],
-                    holdingsValue=result['invested_amount'],
-                    lastUpdated=result['last_updated'].isoformat() if hasattr(result['last_updated'], 'isoformat') else str(result['last_updated'])
-                )
+            # Return the created summary
+            summary = PortfolioSummary(
+                totalValue=total_value,
+                changePercent=change_percent,
+                changeValue=change_value,
+                netWorth=net_worth,
+                assetCount=asset_count,
+                dayChangeValue=day_change_value,
+                dayChangePercent=day_change_percent,
+                totalReturn=total_return,
+                totalReturnPercent=total_return_percent,
+                cashBalance=cash_balance,
+                holdingsValue=holdings_value,
+                lastUpdated=datetime.now().isoformat()
+            )
+        else:
+            columns = [description[0] for description in cursor.description]
+            summary_data = dict(zip(columns, result))
+            
+            summary = PortfolioSummary(
+                totalValue=summary_data['total_value'],
+                changePercent=summary_data['change_percent'],
+                changeValue=summary_data['change_value'],
+                netWorth=summary_data['net_worth'],
+                assetCount=summary_data['asset_count'],
+                dayChangeValue=summary_data['day_change_value'],
+                dayChangePercent=summary_data['day_change_percent'],
+                totalReturn=summary_data['total_return'],
+                totalReturnPercent=summary_data['total_return_percent'],
+                cashBalance=summary_data['cash_balance'],
+                holdingsValue=summary_data['holdings_value'],
+                lastUpdated=summary_data['last_updated']
+            )
+        
+        conn.close()
         
         await log_to_agent_memory(
             user_id,
@@ -190,123 +241,167 @@ async def get_portfolio_summary(
 @router.get("/portfolio/holdings")
 async def get_portfolio_holdings(
     vaultId: Optional[str] = Query(None),
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Get portfolio holdings data for dashboard"""
     try:
-        async with get_db_connection() as conn:
-            where_clause = "WHERE user_id = $1"
-            params = [user_id]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create portfolio holdings table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS PortfolioHoldings (
+                id SERIAL PRIMARY KEY,
+                userId INTEGER NOT NULL,
+                vaultId TEXT,
+                symbol TEXT NOT NULL,
+                asset_name TEXT,
+                asset_class TEXT,
+                sector TEXT,
+                market TEXT DEFAULT 'NZX',
+                quantity REAL NOT NULL DEFAULT 0,
+                average_cost REAL DEFAULT 0,
+                current_price REAL DEFAULT 0,
+                market_value REAL NOT NULL DEFAULT 0,
+                cost_basis REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                unrealized_pnl_percent REAL DEFAULT 0,
+                day_change REAL DEFAULT 0,
+                day_change_percent REAL DEFAULT 0,
+                portfolio_percent REAL DEFAULT 0,
+                broker_account TEXT,
+                last_updated TIMESTAMPTZ DEFAULT NOW(),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(userId, vaultId, symbol, broker_account)
+            )
+        """)
+        
+        # Get existing holdings
+        where_clause = "WHERE userId = %s"
+        params = [user_id]
+        
+        if vaultId:
+            where_clause += " AND vaultId = %s"
+            params.append(vaultId)
+        else:
+            where_clause += " AND vaultId IS NULL"
+        
+        cursor.execute(f"""
+            SELECT * FROM PortfolioHoldings 
+            {where_clause}
+            ORDER BY market_value DESC
+        """, params)
+        
+        results = cursor.fetchall()
+        
+        if not results:
+            # Create demo holdings data
+            demo_holdings = [
+                {
+                    "symbol": "FPH", "asset_name": "Fisher & Paykel Healthcare Corp", "asset_class": "Healthcare", 
+                    "sector": "Healthcare Equipment", "market": "NZX", "quantity": 500, "average_cost": 28.50, 
+                    "current_price": 32.45, "market_value": 16225.00, "cost_basis": 14250.00
+                },
+                {
+                    "symbol": "SPK", "asset_name": "Spark New Zealand Ltd", "asset_class": "Telecommunications", 
+                    "sector": "Telecom Services", "market": "NZX", "quantity": 800, "average_cost": 4.85, 
+                    "current_price": 5.12, "market_value": 4096.00, "cost_basis": 3880.00
+                },
+                {
+                    "symbol": "CSL", "asset_name": "CSL Limited", "asset_class": "Healthcare", 
+                    "sector": "Biotechnology", "market": "ASX", "quantity": 45, "average_cost": 285.60, 
+                    "current_price": 298.75, "market_value": 13443.75, "cost_basis": 12852.00
+                },
+                {
+                    "symbol": "CBA", "asset_name": "Commonwealth Bank of Australia", "asset_class": "Financial", 
+                    "sector": "Banks", "market": "ASX", "quantity": 120, "average_cost": 98.20, 
+                    "current_price": 104.50, "market_value": 12540.00, "cost_basis": 11784.00
+                },
+                {
+                    "symbol": "AAPL", "asset_name": "Apple Inc", "asset_class": "Technology", 
+                    "sector": "Consumer Electronics", "market": "NASDAQ", "quantity": 75, "average_cost": 145.80, 
+                    "current_price": 189.45, "market_value": 14208.75, "cost_basis": 10935.00
+                },
+                {
+                    "symbol": "MSFT", "asset_name": "Microsoft Corporation", "asset_class": "Technology", 
+                    "sector": "Software", "market": "NASDAQ", "quantity": 60, "average_cost": 285.20, 
+                    "current_price": 325.75, "market_value": 19545.00, "cost_basis": 17112.00
+                },
+                {
+                    "symbol": "TSLA", "asset_name": "Tesla Inc", "asset_class": "Consumer Discretionary", 
+                    "sector": "Automobiles", "market": "NASDAQ", "quantity": 25, "average_cost": 195.60, 
+                    "current_price": 248.85, "market_value": 6221.25, "cost_basis": 4890.00
+                },
+                {
+                    "symbol": "VTI", "asset_name": "Vanguard Total Stock Market ETF", "asset_class": "ETF", 
+                    "sector": "Broad Market", "market": "NYSE", "quantity": 150, "average_cost": 195.40, 
+                    "current_price": 218.65, "market_value": 32797.50, "cost_basis": 29310.00
+                }
+            ]
             
-            if vaultId:
-                where_clause += " AND vault_id = $2"
-                params.append(vaultId)
-            else:
-                where_clause += " AND vault_id IS NULL"
+            for holding in demo_holdings:
+                unrealized_pnl = holding["market_value"] - holding["cost_basis"]
+                unrealized_pnl_percent = (unrealized_pnl / holding["cost_basis"]) * 100 if holding["cost_basis"] > 0 else 0
+                day_change = holding["market_value"] * 0.0085  # Simulate 0.85% daily gain
+                day_change_percent = 0.85
+                portfolio_percent = (holding["market_value"] / 125000.00) * 100  # Against total portfolio
+                
+                cursor.execute("""
+                    INSERT INTO PortfolioHoldings 
+                    (userId, vaultId, symbol, asset_name, asset_class, sector, market,
+                     quantity, average_cost, current_price, market_value, cost_basis,
+                     unrealized_pnl, unrealized_pnl_percent, day_change, day_change_percent,
+                     portfolio_percent)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (userId, vaultId, symbol, broker_account) DO NOTHING
+                """, (
+                    user_id, vaultId, holding["symbol"], holding["asset_name"], 
+                    holding["asset_class"], holding["sector"], holding["market"],
+                    holding["quantity"], holding["average_cost"], holding["current_price"],
+                    holding["market_value"], holding["cost_basis"], unrealized_pnl,
+                    unrealized_pnl_percent, day_change, day_change_percent, portfolio_percent
+                ))
             
-            results = await conn.fetch(f"""
-                SELECT * FROM portfolio_holdings 
+            conn.commit()
+            
+            # Re-fetch the created holdings
+            cursor.execute(f"""
+                SELECT * FROM PortfolioHoldings 
                 {where_clause}
                 ORDER BY market_value DESC
-            """, *params)
+            """, params)
             
-            if not results:
-                demo_holdings = [
-                    {
-                        "symbol": "FPH", "asset_name": "Fisher & Paykel Healthcare Corp", "asset_class": "Healthcare", 
-                        "sector": "Healthcare Equipment", "market": "NZX", "quantity": 500, "average_cost": 28.50, 
-                        "current_price": 32.45, "market_value": 16225.00, "cost_basis": 14250.00
-                    },
-                    {
-                        "symbol": "SPK", "asset_name": "Spark New Zealand Ltd", "asset_class": "Telecommunications", 
-                        "sector": "Telecom Services", "market": "NZX", "quantity": 800, "average_cost": 4.85, 
-                        "current_price": 5.12, "market_value": 4096.00, "cost_basis": 3880.00
-                    },
-                    {
-                        "symbol": "CSL", "asset_name": "CSL Limited", "asset_class": "Healthcare", 
-                        "sector": "Biotechnology", "market": "ASX", "quantity": 45, "average_cost": 285.60, 
-                        "current_price": 298.75, "market_value": 13443.75, "cost_basis": 12852.00
-                    },
-                    {
-                        "symbol": "CBA", "asset_name": "Commonwealth Bank of Australia", "asset_class": "Financial", 
-                        "sector": "Banks", "market": "ASX", "quantity": 120, "average_cost": 98.20, 
-                        "current_price": 104.50, "market_value": 12540.00, "cost_basis": 11784.00
-                    },
-                    {
-                        "symbol": "AAPL", "asset_name": "Apple Inc", "asset_class": "Technology", 
-                        "sector": "Consumer Electronics", "market": "NASDAQ", "quantity": 75, "average_cost": 145.80, 
-                        "current_price": 189.45, "market_value": 14208.75, "cost_basis": 10935.00
-                    },
-                    {
-                        "symbol": "MSFT", "asset_name": "Microsoft Corporation", "asset_class": "Technology", 
-                        "sector": "Software", "market": "NASDAQ", "quantity": 60, "average_cost": 285.20, 
-                        "current_price": 325.75, "market_value": 19545.00, "cost_basis": 17112.00
-                    },
-                    {
-                        "symbol": "TSLA", "asset_name": "Tesla Inc", "asset_class": "Consumer Discretionary", 
-                        "sector": "Automobiles", "market": "NASDAQ", "quantity": 25, "average_cost": 195.60, 
-                        "current_price": 248.85, "market_value": 6221.25, "cost_basis": 4890.00
-                    },
-                    {
-                        "symbol": "VTI", "asset_name": "Vanguard Total Stock Market ETF", "asset_class": "ETF", 
-                        "sector": "Broad Market", "market": "NYSE", "quantity": 150, "average_cost": 195.40, 
-                        "current_price": 218.65, "market_value": 32797.50, "cost_basis": 29310.00
-                    }
-                ]
-                
-                for holding in demo_holdings:
-                    unrealized_pnl = holding["market_value"] - holding["cost_basis"]
-                    unrealized_pnl_percent = (unrealized_pnl / holding["cost_basis"]) * 100 if holding["cost_basis"] > 0 else 0
-                    day_change = holding["market_value"] * 0.0085
-                    day_change_percent = 0.85
-                    portfolio_percent = (holding["market_value"] / 125000.00) * 100
-                    
-                    await conn.execute("""
-                        INSERT INTO portfolio_holdings 
-                        (user_id, vault_id, symbol, asset_name, asset_class, sector, market,
-                         quantity, average_cost, current_price, market_value, cost_basis,
-                         unrealized_pnl, unrealized_pnl_percent, day_change, day_change_percent,
-                         portfolio_percent)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                        ON CONFLICT (user_id, vault_id, symbol, broker_account) DO NOTHING
-                    """,
-                        user_id, vaultId, holding["symbol"], holding["asset_name"], 
-                        holding["asset_class"], holding["sector"], holding["market"],
-                        holding["quantity"], holding["average_cost"], holding["current_price"],
-                        holding["market_value"], holding["cost_basis"], unrealized_pnl,
-                        unrealized_pnl_percent, day_change, day_change_percent, portfolio_percent
-                    )
-                
-                results = await conn.fetch(f"""
-                    SELECT * FROM portfolio_holdings 
-                    {where_clause}
-                    ORDER BY market_value DESC
-                """, *params)
+            results = cursor.fetchall()
+        
+        columns = [description[0] for description in cursor.description]
+        holdings = []
+        
+        for row in results:
+            holding_data = dict(zip(columns, row))
             
-            holdings = []
+            holding = PortfolioHolding(
+                symbol=holding_data['symbol'],
+                assetName=holding_data['asset_name'],
+                assetClass=holding_data['asset_class'],
+                sector=holding_data['sector'],
+                market=holding_data['market'],
+                quantity=holding_data['quantity'],
+                averageCost=holding_data['average_cost'],
+                currentPrice=holding_data['current_price'],
+                marketValue=holding_data['market_value'],
+                costBasis=holding_data['cost_basis'],
+                unrealizedPnl=holding_data['unrealized_pnl'],
+                unrealizedPnlPercent=holding_data['unrealized_pnl_percent'],
+                dayChange=holding_data['day_change'],
+                dayChangePercent=holding_data['day_change_percent'],
+                portfolioPercent=holding_data['portfolio_percent'],
+                brokerAccount=holding_data['broker_account'],
+                lastUpdated=holding_data['last_updated']
+            )
             
-            for row in results:
-                holding = PortfolioHolding(
-                    symbol=row['symbol'],
-                    assetName=row['asset_name'],
-                    assetClass=row['asset_class'],
-                    sector=row['sector'],
-                    market=row['market'],
-                    quantity=row['quantity'],
-                    averageCost=row['average_cost'],
-                    currentPrice=row['current_price'],
-                    marketValue=row['market_value'],
-                    costBasis=row['cost_basis'],
-                    unrealizedPnl=row['unrealized_pnl'],
-                    unrealizedPnlPercent=row['unrealized_pnl_percent'],
-                    dayChange=row['day_change'],
-                    dayChangePercent=row['day_change_percent'],
-                    portfolioPercent=row['portfolio_percent'],
-                    brokerAccount=row['broker_account'],
-                    lastUpdated=row['last_updated'].isoformat() if hasattr(row['last_updated'], 'isoformat') else str(row['last_updated'])
-                )
-                
-                holdings.append(holding.dict())
+            holdings.append(holding.dict())
+        
+        conn.close()
         
         await log_to_agent_memory(
             user_id,
@@ -325,38 +420,41 @@ async def get_portfolio_holdings(
 @router.post("/portfolio/refresh")
 async def refresh_portfolio_data(
     vaultId: Optional[str] = None,
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Refresh portfolio data from all connected sources"""
     try:
-        async with get_db_connection() as conn:
-            where_clause = "WHERE user_id = $1"
-            timestamp = datetime.now()
-            
-            if vaultId:
-                await conn.execute(f"""
-                    UPDATE portfolio_summary 
-                    SET last_updated = $2
-                    WHERE user_id = $1 AND vault_id = $3
-                """, user_id, timestamp, vaultId)
-                
-                await conn.execute(f"""
-                    UPDATE portfolio_holdings 
-                    SET last_updated = $2
-                    WHERE user_id = $1 AND vault_id = $3
-                """, user_id, timestamp, vaultId)
-            else:
-                await conn.execute(f"""
-                    UPDATE portfolio_summary 
-                    SET last_updated = $2
-                    WHERE user_id = $1 AND vault_id IS NULL
-                """, user_id, timestamp)
-                
-                await conn.execute(f"""
-                    UPDATE portfolio_holdings 
-                    SET last_updated = $2
-                    WHERE user_id = $1 AND vault_id IS NULL
-                """, user_id, timestamp)
+        # This would normally trigger data refresh from brokers/exchanges
+        # For now, we'll update the last_updated timestamp
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        where_clause = "WHERE userId = ?"
+        params = [user_id, datetime.now().isoformat()]
+        
+        if vaultId:
+            where_clause += " AND vaultId = ?"
+            params.insert(-1, vaultId)
+        else:
+            where_clause += " AND vaultId IS NULL"
+        
+        # Update summary
+        cursor.execute(f"""
+            UPDATE PortfolioSummary 
+            SET last_updated = ?
+            {where_clause}
+        """, params)
+        
+        # Update holdings
+        cursor.execute(f"""
+            UPDATE PortfolioHoldings 
+            SET last_updated = ?
+            {where_clause}
+        """, params)
+        
+        conn.commit()
+        conn.close()
         
         await log_to_agent_memory(
             user_id,
@@ -364,13 +462,13 @@ async def refresh_portfolio_data(
             f"Refreshed portfolio data",
             json.dumps({"vaultId": vaultId}),
             "Portfolio data refresh completed",
-            {"vaultId": vaultId, "refresh_time": timestamp.isoformat()}
+            {"vaultId": vaultId, "refresh_time": datetime.now().isoformat()}
         )
         
         return {
             "success": True,
             "message": "Portfolio data refreshed successfully",
-            "refreshedAt": timestamp.isoformat()
+            "refreshedAt": datetime.now().isoformat()
         }
         
     except Exception as e:
@@ -393,7 +491,7 @@ async def get_combined_portfolio():
 @router.get("/portfolio/snapshot")
 async def get_portfolio_snapshot(
     vaultId: Optional[str] = Query(None),
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Get portfolio snapshot with allocation and overlay data"""
     try:
@@ -448,7 +546,7 @@ async def get_portfolio_snapshot(
 async def get_portfolio_performance(
     vaultId: Optional[str] = Query(None),
     timeRange: str = Query("7d", description="Time range: 7d or 30d"),
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Get portfolio performance history"""
     try:
@@ -492,7 +590,7 @@ async def get_portfolio_performance(
 @router.get("/strategy/overlays")
 async def get_strategy_overlays(
     vaultId: Optional[str] = Query(None),
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Get strategy overlay state"""
     try:
@@ -540,7 +638,7 @@ async def get_strategy_overlays(
 @router.get("/portfolio/rebalance-recommendations")
 async def get_rebalance_recommendations(
     vaultId: Optional[str] = Query(None),
-    user_id: str = "1"
+    user_id: int = 1  # TODO: Get from authentication
 ):
     """Get portfolio rebalance recommendations"""
     try:
@@ -590,4 +688,4 @@ async def get_rebalance_recommendations(
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))            
+        raise HTTPException(status_code=500, detail=str(e))        

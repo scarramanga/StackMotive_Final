@@ -3,7 +3,9 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-from database import get_db_connection
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -28,51 +30,85 @@ class RuleExecution(BaseModel):
     success: bool
     errorMessage: Optional[str] = None
 
+# Database connection
+def get_db_connection():
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
+
 # Agent Memory logging
-async def log_to_agent_memory(user_id: str, action_type: str, action_summary: str, input_data: Optional[str], output_data: str, metadata: Dict[str, Any]):
+async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
     try:
-        async with get_db_connection() as conn:
-            await conn.execute("""
-                INSERT INTO agent_memory 
-                (user_id, block_id, action, context, user_input, agent_response, metadata, timestamp, session_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """,
-                user_id,
-                "block_10",
-                action_type,
-                action_summary,
-                input_data,
-                output_data,
-                json.dumps(metadata) if metadata else None,
-                datetime.now(),
-                f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO AgentMemory 
+            (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            user_id,
+            "block_10",
+            action_type,
+            action_summary,
+            input_data,
+            output_data,
+            json.dumps(metadata) if metadata else None,
+            datetime.now().isoformat(),
+            f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        ))
+        
+        conn.commit()
+        conn.close()
+        
     except Exception as e:
         print(f"Failed to log to agent memory: {e}")
 
 @router.get("/rules/user/{user_id}")
-async def get_user_trade_rules(user_id: str):
+async def get_user_trade_rules(user_id: int):
     """Get all trade rules for a user"""
     try:
-        async with get_db_connection() as conn:
-            rows = await conn.fetch("""
-                SELECT * FROM user_trade_rules 
-                WHERE user_id = $1
-                ORDER BY created_at DESC
-            """, user_id)
-            
-            rules = [dict(row) for row in rows]
-            
-            await log_to_agent_memory(
-                user_id,
-                "trade_rules_retrieved",
-                f"Retrieved {len(rules)} trade rules",
-                None,
-                f"Found {len(rules)} active trade rules",
-                {"ruleCount": len(rules)}
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create UserTradeRules table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS UserTradeRule (
+                id SERIAL PRIMARY KEY,
+                userId INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                ruleType TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                frequency TEXT,
+                amount REAL,
+                enabled BOOLEAN NOT NULL DEFAULT true,
+                lastTriggered TIMESTAMPTZ,
+                createdAt TIMESTAMPTZ DEFAULT NOW(),
+                updatedAt TIMESTAMPTZ DEFAULT NOW(),
+                FOREIGN KEY (userId) REFERENCES User (id)
             )
-            
-            return {"rules": rules}
+        """)
+        
+        cursor.execute("""
+            SELECT * FROM UserTradeRule 
+            WHERE userId = %s
+            ORDER BY createdAt DESC
+        """, (user_id,))
+        
+        columns = [description[0] for description in cursor.description]
+        rules = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        await log_to_agent_memory(
+            user_id,
+            "trade_rules_retrieved",
+            f"Retrieved {len(rules)} trade rules",
+            None,
+            f"Found {len(rules)} active trade rules",
+            {"ruleCount": len(rules)}
+        )
+        
+        return {"rules": rules}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -81,72 +117,83 @@ async def get_user_trade_rules(user_id: str):
 async def save_trade_rule(rule: UserTradeRule):
     """Save or update a trade rule"""
     try:
-        async with get_db_connection() as conn:
-            rule_id = await conn.fetchval("""
-                INSERT INTO user_trade_rules 
-                (user_id, symbol, rule_type, threshold, frequency, amount, enabled, last_triggered)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id
-            """,
-                str(rule.userId), rule.symbol, rule.ruleType, rule.threshold,
-                rule.frequency, rule.amount, rule.enabled, rule.lastTriggered
-            )
-            
-            await log_to_agent_memory(
-                str(rule.userId),
-                "trade_rule_created",
-                f"Created {rule.ruleType} rule for {rule.symbol}",
-                rule.json(),
-                f"Rule created successfully with ID {rule_id}",
-                {
-                    "ruleId": str(rule_id),
-                    "symbol": rule.symbol,
-                    "ruleType": rule.ruleType,
-                    "threshold": rule.threshold
-                }
-            )
-            
-            return {
-                "success": True,
-                "ruleId": str(rule_id),
-                "message": f"{rule.ruleType} rule created for {rule.symbol}"
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO UserTradeRule 
+            (userId, symbol, ruleType, threshold, frequency, amount, enabled, lastTriggered)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            rule.userId, rule.symbol, rule.ruleType, rule.threshold,
+            rule.frequency, rule.amount, rule.enabled, rule.lastTriggered
+        ))
+        
+        rule_id = cursor.lastrowid
+        
+        conn.commit()
+        conn.close()
+        
+        await log_to_agent_memory(
+            rule.userId,
+            "trade_rule_created",
+            f"Created {rule.ruleType} rule for {rule.symbol}",
+            rule.json(),
+            f"Rule created successfully with ID {rule_id}",
+            {
+                "ruleId": rule_id,
+                "symbol": rule.symbol,
+                "ruleType": rule.ruleType,
+                "threshold": rule.threshold
             }
+        )
+        
+        return {
+            "success": True,
+            "ruleId": rule_id,
+            "message": f"{rule.ruleType} rule created for {rule.symbol}"
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.put("/rules/{rule_id}")
-async def update_trade_rule(rule_id: str, rule: UserTradeRule):
+async def update_trade_rule(rule_id: int, rule: UserTradeRule):
     """Update an existing trade rule"""
     try:
-        async with get_db_connection() as conn:
-            result = await conn.execute("""
-                UPDATE user_trade_rules 
-                SET threshold = $1, frequency = $2, amount = $3, enabled = $4, updated_at = $5
-                WHERE id = $6 AND user_id = $7
-            """,
-                rule.threshold, rule.frequency, rule.amount, rule.enabled,
-                datetime.now(), rule_id, str(rule.userId)
-            )
-            
-            if result == "UPDATE 0":
-                raise HTTPException(status_code=404, detail="Rule not found or access denied")
-            
-            await log_to_agent_memory(
-                str(rule.userId),
-                "trade_rule_updated",
-                f"Updated {rule.ruleType} rule for {rule.symbol}",
-                rule.json(),
-                f"Rule {rule_id} updated successfully",
-                {
-                    "ruleId": rule_id,
-                    "symbol": rule.symbol,
-                    "ruleType": rule.ruleType,
-                    "enabled": rule.enabled
-                }
-            )
-            
-            return {"success": True, "message": f"Rule {rule_id} updated successfully"}
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE UserTradeRule 
+            SET threshold = %s, frequency = %s, amount = %s, enabled = %s, updatedAt = %s
+            WHERE id = %s AND userId = %s
+        """, (
+            rule.threshold, rule.frequency, rule.amount, rule.enabled,
+            datetime.now().isoformat(), rule_id, rule.userId
+        ))
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Rule not found or access denied")
+        
+        conn.commit()
+        conn.close()
+        
+        await log_to_agent_memory(
+            rule.userId,
+            "trade_rule_updated",
+            f"Updated {rule.ruleType} rule for {rule.symbol}",
+            rule.json(),
+            f"Rule {rule_id} updated successfully",
+            {
+                "ruleId": rule_id,
+                "symbol": rule.symbol,
+                "ruleType": rule.ruleType,
+                "enabled": rule.enabled
+            }
+        )
+        
+        return {"success": True, "message": f"Rule {rule_id} updated successfully"}
         
     except HTTPException:
         raise
@@ -154,37 +201,45 @@ async def update_trade_rule(rule_id: str, rule: UserTradeRule):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/rules/{rule_id}/{user_id}")
-async def delete_trade_rule(rule_id: str, user_id: str):
+async def delete_trade_rule(rule_id: int, user_id: int):
     """Delete a trade rule"""
     try:
-        async with get_db_connection() as conn:
-            rule_info = await conn.fetchrow("""
-                SELECT symbol, rule_type FROM user_trade_rules 
-                WHERE id = $1 AND user_id = $2
-            """, rule_id, user_id)
-            
-            if not rule_info:
-                raise HTTPException(status_code=404, detail="Rule not found or access denied")
-            
-            await conn.execute("""
-                DELETE FROM user_trade_rules 
-                WHERE id = $1 AND user_id = $2
-            """, rule_id, user_id)
-            
-            await log_to_agent_memory(
-                user_id,
-                "trade_rule_deleted",
-                f"Deleted {rule_info['rule_type']} rule for {rule_info['symbol']}",
-                f"rule_id: {rule_id}",
-                f"Rule {rule_id} deleted successfully",
-                {
-                    "ruleId": rule_id,
-                    "symbol": rule_info['symbol'],
-                    "ruleType": rule_info['rule_type']
-                }
-            )
-            
-            return {"success": True, "message": f"Rule {rule_id} deleted successfully"}
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get rule info for logging
+        cursor.execute("""
+            SELECT symbol, ruleType FROM UserTradeRule 
+            WHERE id = %s AND userId = %s
+        """, (rule_id, user_id))
+        
+        rule_info = cursor.fetchone()
+        if not rule_info:
+            raise HTTPException(status_code=404, detail="Rule not found or access denied")
+        
+        # Delete rule
+        cursor.execute("""
+            DELETE FROM UserTradeRule 
+            WHERE id = %s AND userId = %s
+        """, (rule_id, user_id))
+        
+        conn.commit()
+        conn.close()
+        
+        await log_to_agent_memory(
+            user_id,
+            "trade_rule_deleted",
+            f"Deleted {rule_info[1]} rule for {rule_info[0]}",
+            f"rule_id: {rule_id}",
+            f"Rule {rule_id} deleted successfully",
+            {
+                "ruleId": rule_id,
+                "symbol": rule_info[0],
+                "ruleType": rule_info[1]
+            }
+        )
+        
+        return {"success": True, "message": f"Rule {rule_id} deleted successfully"}
         
     except HTTPException:
         raise
@@ -192,62 +247,84 @@ async def delete_trade_rule(rule_id: str, user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/rules/execute/{rule_id}")
-async def execute_trade_rule(rule_id: str, execution: RuleExecution):
+async def execute_trade_rule(rule_id: int, execution: RuleExecution):
     """Execute a trade rule (simulate execution)"""
     try:
-        async with get_db_connection() as conn:
-            rule_data = await conn.fetchrow("""
-                SELECT user_id, symbol, rule_type, threshold FROM user_trade_rules 
-                WHERE id = $1
-            """, rule_id)
-            
-            if not rule_data:
-                raise HTTPException(status_code=404, detail="Rule not found")
-            
-            user_id = rule_data['user_id']
-            symbol = rule_data['symbol']
-            rule_type = rule_data['rule_type']
-            threshold = rule_data['threshold']
-            
-            execution_id = await conn.fetchval("""
-                INSERT INTO rule_executions 
-                (rule_id, execution_type, quantity, price, success, error_message)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-            """,
-                rule_id, execution.executionType, execution.quantity, 
-                execution.price, execution.success, execution.errorMessage
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create RuleExecution table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS RuleExecution (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ruleId INTEGER NOT NULL,
+                executionType TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                price REAL NOT NULL,
+                success BOOLEAN NOT NULL,
+                errorMessage TEXT,
+                executedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (ruleId) REFERENCES UserTradeRule (id)
             )
-            
-            if execution.success:
-                await conn.execute("""
-                    UPDATE user_trade_rules 
-                    SET last_triggered = $1, updated_at = $2
-                    WHERE id = $3
-                """, datetime.now(), datetime.now(), rule_id)
-            
-            await log_to_agent_memory(
-                str(user_id),
-                "trade_rule_executed",
-                f"Executed {rule_type} rule for {symbol}",
-                execution.json(),
-                f"Rule execution {'successful' if execution.success else 'failed'}",
-                {
-                    "executionId": str(execution_id),
-                    "ruleId": rule_id,
-                    "symbol": symbol,
-                    "ruleType": rule_type,
-                    "quantity": execution.quantity,
-                    "price": execution.price,
-                    "success": execution.success
-                }
-            )
-            
-            return {
-                "success": execution.success,
-                "executionId": str(execution_id),
-                "message": f"Rule execution {'completed' if execution.success else 'failed'}"
+        """)
+        
+        # Get rule details
+        cursor.execute("""
+            SELECT userId, symbol, ruleType, threshold FROM UserTradeRule 
+            WHERE id = %s
+        """, (rule_id,))
+        
+        rule_data = cursor.fetchone()
+        if not rule_data:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        
+        user_id, symbol, rule_type, threshold = rule_data
+        
+        # Record execution
+        cursor.execute("""
+            INSERT INTO RuleExecution 
+            (ruleId, executionType, quantity, price, success, errorMessage)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            rule_id, execution.executionType, execution.quantity, 
+            execution.price, execution.success, execution.errorMessage
+        ))
+        
+        execution_id = cursor.lastrowid
+        
+        # Update rule's last triggered time if successful
+        if execution.success:
+            cursor.execute("""
+                UPDATE UserTradeRule 
+                SET lastTriggered = %s, updatedAt = %s
+                WHERE id = %s
+            """, (datetime.now().isoformat(), datetime.now().isoformat(), rule_id))
+        
+        conn.commit()
+        conn.close()
+        
+        await log_to_agent_memory(
+            user_id,
+            "trade_rule_executed",
+            f"Executed {rule_type} rule for {symbol}",
+            execution.json(),
+            f"Rule execution {'successful' if execution.success else 'failed'}",
+            {
+                "executionId": execution_id,
+                "ruleId": rule_id,
+                "symbol": symbol,
+                "ruleType": rule_type,
+                "quantity": execution.quantity,
+                "price": execution.price,
+                "success": execution.success
             }
+        )
+        
+        return {
+            "success": execution.success,
+            "executionId": execution_id,
+            "message": f"Rule execution {'completed' if execution.success else 'failed'}"
+        }
         
     except HTTPException:
         raise
@@ -255,178 +332,202 @@ async def execute_trade_rule(rule_id: str, execution: RuleExecution):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/rules/history/{user_id}")
-async def get_rule_execution_history(user_id: str, limit: int = 20):
+async def get_rule_execution_history(user_id: int, limit: int = 20):
     """Get execution history for user's rules"""
     try:
-        async with get_db_connection() as conn:
-            rows = await conn.fetch("""
-                SELECT 
-                    re.*,
-                    utr.symbol,
-                    utr.rule_type,
-                    utr.threshold
-                FROM rule_executions re
-                JOIN user_trade_rules utr ON re.rule_id = utr.id
-                WHERE utr.user_id = $1
-                ORDER BY re.executed_at DESC
-                LIMIT $2
-            """, user_id, limit)
-            
-            history = [dict(row) for row in rows]
-            
-            return {"history": history}
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                re.*,
+                utr.symbol,
+                utr.ruleType,
+                utr.threshold
+            FROM RuleExecution re
+            JOIN UserTradeRule utr ON re.ruleId = utr.id
+            WHERE utr.userId = %s
+            ORDER BY re.executedAt DESC
+            LIMIT %s
+        """, (user_id, limit))
+        
+        columns = [description[0] for description in cursor.description]
+        history = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return {"history": history}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/rules/check-triggers/{user_id}")
-async def check_rule_triggers(user_id: str):
+async def check_rule_triggers(user_id: int):
     """Check if any rules should be triggered based on current market conditions"""
     try:
-        async with get_db_connection() as conn:
-            rows = await conn.fetch("""
-                SELECT * FROM user_trade_rules 
-                WHERE user_id = $1 AND enabled = true
-            """, user_id)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get enabled rules
+        cursor.execute("""
+            SELECT * FROM UserTradeRule 
+            WHERE userId = %s AND enabled = true
+        """, (user_id,))
+        
+        columns = [description[0] for description in cursor.description]
+        rules = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        triggered_rules = []
+        
+        for rule in rules:
+            symbol = rule['symbol']
+            rule_type = rule['ruleType']
+            threshold = rule['threshold']
             
-            rules = [dict(row) for row in rows]
-            triggered_rules = []
+            # Get current price for the symbol
+            cursor.execute("""
+                SELECT currentPrice FROM PortfolioPosition 
+                WHERE symbol = %s AND userId = %s
+                ORDER BY lastUpdated DESC
+                LIMIT 1
+            """, (symbol, user_id))
             
-            for rule in rules:
-                symbol = rule['symbol']
-                rule_type = rule['rule_type']
-                threshold = rule['threshold']
+            price_result = cursor.fetchone()
+            if not price_result:
+                continue
                 
-                price_row = await conn.fetchrow("""
-                    SELECT current_price FROM portfolio_holdings 
-                    WHERE symbol = $1 AND user_id = $2
-                    ORDER BY last_updated DESC
-                    LIMIT 1
-                """, symbol, user_id)
+            current_price = price_result[0]
+            
+            # Check if rule should trigger
+            should_trigger = False
+            trigger_reason = ""
+            
+            if rule_type == "DCA":
+                # DCA triggers based on frequency or price target
+                last_triggered = rule.get('lastTriggered')
+                frequency = rule.get('frequency', 'monthly')
                 
-                if not price_row:
-                    continue
+                if last_triggered:
+                    last_date = datetime.fromisoformat(last_triggered)
+                    days_since = (datetime.now() - last_date).days
                     
-                current_price = price_row['current_price']
-                
-                should_trigger = False
-                trigger_reason = ""
-                
-                if rule_type == "DCA":
-                    last_triggered = rule.get('last_triggered')
-                    frequency = rule.get('frequency', 'monthly')
+                    if frequency == "daily" and days_since >= 1:
+                        should_trigger = True
+                        trigger_reason = "Daily DCA schedule"
+                    elif frequency == "weekly" and days_since >= 7:
+                        should_trigger = True
+                        trigger_reason = "Weekly DCA schedule"
+                    elif frequency == "monthly" and days_since >= 30:
+                        should_trigger = True
+                        trigger_reason = "Monthly DCA schedule"
+                else:
+                    should_trigger = True
+                    trigger_reason = "First DCA execution"
                     
-                    if last_triggered:
-                        days_since = (datetime.now() - last_triggered).days
-                        
-                        if frequency == "daily" and days_since >= 1:
-                            should_trigger = True
-                            trigger_reason = "Daily DCA schedule"
-                        elif frequency == "weekly" and days_since >= 7:
-                            should_trigger = True
-                            trigger_reason = "Weekly DCA schedule"
-                        elif frequency == "monthly" and days_since >= 30:
-                            should_trigger = True
-                            trigger_reason = "Monthly DCA schedule"
-                    else:
-                        should_trigger = True
-                        trigger_reason = "First DCA execution"
-                        
-                elif rule_type == "Stop-Loss":
-                    if current_price <= threshold:
-                        should_trigger = True
-                        trigger_reason = f"Price ${current_price} dropped below stop-loss threshold ${threshold}"
-                
-                if should_trigger:
-                    triggered_rules.append({
-                        "ruleId": str(rule['id']),
-                        "symbol": symbol,
-                        "ruleType": rule_type,
-                        "threshold": threshold,
-                        "currentPrice": current_price,
-                        "triggerReason": trigger_reason,
-                        "suggestedAction": "BUY" if rule_type == "DCA" else "SELL",
-                        "suggestedQuantity": rule.get('amount', 100) / current_price if rule_type == "DCA" else 1.0
-                    })
+            elif rule_type == "Stop-Loss":
+                # Stop-loss triggers when price drops below threshold
+                if current_price <= threshold:
+                    should_trigger = True
+                    trigger_reason = f"Price ${current_price} dropped below stop-loss threshold ${threshold}"
             
-            await log_to_agent_memory(
-                user_id,
-                "rule_triggers_checked",
-                f"Checked {len(rules)} rules, {len(triggered_rules)} triggers found",
-                f"user_id: {user_id}",
-                f"Found {len(triggered_rules)} triggered rules",
-                {
-                    "totalRules": len(rules),
-                    "triggeredRules": len(triggered_rules),
-                    "triggers": [r['ruleId'] for r in triggered_rules]
-                }
-            )
-            
-            return {
-                "triggeredRules": triggered_rules,
-                "totalRulesChecked": len(rules),
-                "lastChecked": datetime.now().isoformat()
+            if should_trigger:
+                triggered_rules.append({
+                    "ruleId": rule['id'],
+                    "symbol": symbol,
+                    "ruleType": rule_type,
+                    "threshold": threshold,
+                    "currentPrice": current_price,
+                    "triggerReason": trigger_reason,
+                    "suggestedAction": "BUY" if rule_type == "DCA" else "SELL",
+                    "suggestedQuantity": rule.get('amount', 100) / current_price if rule_type == "DCA" else 1.0
+                })
+        
+        conn.close()
+        
+        await log_to_agent_memory(
+            user_id,
+            "rule_triggers_checked",
+            f"Checked {len(rules)} rules, {len(triggered_rules)} triggers found",
+            f"user_id: {user_id}",
+            f"Found {len(triggered_rules)} triggered rules",
+            {
+                "totalRules": len(rules),
+                "triggeredRules": len(triggered_rules),
+                "triggers": [r['ruleId'] for r in triggered_rules]
             }
+        )
+        
+        return {
+            "triggeredRules": triggered_rules,
+            "totalRulesChecked": len(rules),
+            "lastChecked": datetime.now().isoformat()
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/rules/analytics/{user_id}")
-async def get_rule_analytics(user_id: str):
+async def get_rule_analytics(user_id: int):
     """Get analytics for user's trade rules"""
     try:
-        async with get_db_connection() as conn:
-            rule_rows = await conn.fetch("""
-                SELECT 
-                    rule_type,
-                    COUNT(*) as count,
-                    AVG(threshold) as avg_threshold,
-                    COUNT(*) FILTER (WHERE enabled = true) as enabled_count
-                FROM user_trade_rules 
-                WHERE user_id = $1
-                GROUP BY rule_type
-            """, user_id)
-            
-            rule_summary = [
-                {
-                    "ruleType": row['rule_type'],
-                    "count": row['count'],
-                    "avgThreshold": float(row['avg_threshold']) if row['avg_threshold'] else 0,
-                    "enabledCount": row['enabled_count']
-                }
-                for row in rule_rows
-            ]
-            
-            exec_rows = await conn.fetch("""
-                SELECT 
-                    utr.rule_type,
-                    COUNT(re.id) as total_executions,
-                    COUNT(*) FILTER (WHERE re.success = true) as successful_executions,
-                    AVG(re.quantity) as avg_quantity,
-                    AVG(re.price) as avg_price
-                FROM user_trade_rules utr
-                LEFT JOIN rule_executions re ON utr.id = re.rule_id
-                WHERE utr.user_id = $1
-                GROUP BY utr.rule_type
-            """, user_id)
-            
-            execution_summary = [
-                {
-                    "ruleType": row['rule_type'],
-                    "totalExecutions": row['total_executions'] or 0,
-                    "successfulExecutions": row['successful_executions'] or 0,
-                    "successRate": (row['successful_executions'] / row['total_executions'] * 100) if row['total_executions'] and row['total_executions'] > 0 else 0,
-                    "avgQuantity": float(row['avg_quantity']) if row['avg_quantity'] else 0,
-                    "avgPrice": float(row['avg_price']) if row['avg_price'] else 0
-                }
-                for row in exec_rows
-            ]
-            
-            return {
-                "ruleSummary": rule_summary,
-                "executionSummary": execution_summary,
-                "generatedAt": datetime.now().isoformat()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Rule summary
+        cursor.execute("""
+            SELECT 
+                ruleType,
+                COUNT(*) as count,
+                AVG(threshold) as avgThreshold,
+                SUM(CASE WHEN enabled = true THEN 1 ELSE 0 END) as enabledCount
+            FROM UserTradeRule 
+            WHERE userId = %s
+            GROUP BY ruleType
+        """, (user_id,))
+        
+        rule_summary = [
+            {
+                "ruleType": row[0],
+                "count": row[1],
+                "avgThreshold": row[2],
+                "enabledCount": row[3]
             }
+            for row in cursor.fetchall()
+        ]
+        
+        # Execution summary
+        cursor.execute("""
+            SELECT 
+                utr.ruleType,
+                COUNT(re.id) as totalExecutions,
+                SUM(CASE WHEN re.success = true THEN 1 ELSE 0 END) as successfulExecutions,
+                AVG(re.quantity) as avgQuantity,
+                AVG(re.price) as avgPrice
+            FROM UserTradeRule utr
+            LEFT JOIN RuleExecution re ON utr.id = re.ruleId
+            WHERE utr.userId = %s
+            GROUP BY utr.ruleType
+        """, (user_id,))
+        
+        execution_summary = [
+            {
+                "ruleType": row[0],
+                "totalExecutions": row[1] or 0,
+                "successfulExecutions": row[2] or 0,
+                "successRate": (row[2] / row[1] * 100) if row[1] and row[1] > 0 else 0,
+                "avgQuantity": row[3] or 0,
+                "avgPrice": row[4] or 0
+            }
+            for row in cursor.fetchall()
+        ]
+        
+        conn.close()
+        
+        return {
+            "ruleSummary": rule_summary,
+            "executionSummary": execution_summary,
+            "generatedAt": datetime.now().isoformat()
+        }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))    
