@@ -3,8 +3,9 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -29,8 +30,8 @@ class SyncTrigger(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -41,7 +42,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_6",
@@ -70,18 +71,18 @@ async def get_sync_configurations(user_id: int):
         # Create SyncConfig table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS SyncConfig (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 syncSource TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT 1,
-                autoSync BOOLEAN NOT NULL DEFAULT 0,
+                enabled BOOLEAN NOT NULL DEFAULT true,
+                autoSync BOOLEAN NOT NULL DEFAULT false,
                 frequency TEXT NOT NULL DEFAULT 'manual',
                 credentials TEXT,
-                lastSyncTime TEXT,
+                lastSyncTime TIMESTAMPTZ,
                 syncStatus TEXT NOT NULL DEFAULT 'idle',
                 errorMessage TEXT,
-                createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                createdAt TIMESTAMPTZ DEFAULT NOW(),
+                updatedAt TIMESTAMPTZ DEFAULT NOW(),
                 FOREIGN KEY (userId) REFERENCES User (id),
                 UNIQUE(userId, syncSource)
             )
@@ -89,7 +90,7 @@ async def get_sync_configurations(user_id: int):
         
         cursor.execute("""
             SELECT * FROM SyncConfig 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY syncSource
         """, (user_id,))
         
@@ -127,7 +128,7 @@ async def save_sync_configuration(config: SyncConfig):
         # Check if config exists
         cursor.execute("""
             SELECT id FROM SyncConfig 
-            WHERE userId = ? AND syncSource = ?
+            WHERE userId = %s AND syncSource = %s
         """, (config.userId, config.syncSource))
         
         existing = cursor.fetchone()
@@ -136,10 +137,10 @@ async def save_sync_configuration(config: SyncConfig):
             # Update existing
             cursor.execute("""
                 UPDATE SyncConfig 
-                SET enabled = ?, autoSync = ?, frequency = ?, 
-                    credentials = ?, syncStatus = ?, errorMessage = ?, 
-                    updatedAt = ?
-                WHERE userId = ? AND syncSource = ?
+                SET enabled = %s, autoSync = %s, frequency = %s, 
+                    credentials = %s, syncStatus = %s, errorMessage = %s, 
+                    updatedAt = %s
+                WHERE userId = %s AND syncSource = %s
             """, (
                 config.enabled,
                 config.autoSync,
@@ -158,7 +159,7 @@ async def save_sync_configuration(config: SyncConfig):
                 INSERT INTO SyncConfig 
                 (userId, syncSource, enabled, autoSync, frequency, 
                  credentials, lastSyncTime, syncStatus, errorMessage)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 config.userId,
                 config.syncSource,
@@ -204,7 +205,7 @@ async def trigger_sync(trigger: SyncTrigger):
         # Get sync config
         cursor.execute("""
             SELECT * FROM SyncConfig 
-            WHERE userId = ? AND syncSource = ?
+            WHERE userId = %s AND syncSource = %s
         """, (trigger.userId, trigger.syncSource))
         
         config = cursor.fetchone()
@@ -217,8 +218,8 @@ async def trigger_sync(trigger: SyncTrigger):
         # Update sync status to "syncing"
         cursor.execute("""
             UPDATE SyncConfig 
-            SET syncStatus = 'syncing', errorMessage = NULL, updatedAt = ?
-            WHERE userId = ? AND syncSource = ?
+            SET syncStatus = 'syncing', errorMessage = NULL, updatedAt = %s
+            WHERE userId = %s AND syncSource = %s
         """, (datetime.now().isoformat(), trigger.userId, trigger.syncSource))
         
         # Simulate sync process (in real implementation, call actual sync services)
@@ -231,7 +232,7 @@ async def trigger_sync(trigger: SyncTrigger):
         if sync_success:
             # Create some test sync data
             cursor.execute("""
-                SELECT COUNT(*) FROM PortfolioPosition WHERE userId = ? AND syncSource = ?
+                SELECT COUNT(*) FROM PortfolioPosition WHERE userId = %s AND syncSource = %s
             """, (trigger.userId, trigger.syncSource))
             
             existing_count = cursor.fetchone()[0]
@@ -253,15 +254,15 @@ async def trigger_sync(trigger: SyncTrigger):
                         INSERT INTO PortfolioPosition 
                         (userId, symbol, name, quantity, avgPrice, currentPrice, 
                          assetClass, account, syncSource)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (trigger.userId, symbol, name, qty, avg_price, current_price,
                           asset_class, f"{trigger.syncSource}_account", trigger.syncSource))
             
             # Update sync status to success
             cursor.execute("""
                 UPDATE SyncConfig 
-                SET syncStatus = 'success', lastSyncTime = ?, updatedAt = ?
-                WHERE userId = ? AND syncSource = ?
+                SET syncStatus = 'success', lastSyncTime = %s, updatedAt = %s
+                WHERE userId = %s AND syncSource = %s
             """, (datetime.now().isoformat(), datetime.now().isoformat(),
                   trigger.userId, trigger.syncSource))
             
@@ -273,8 +274,8 @@ async def trigger_sync(trigger: SyncTrigger):
             error_msg = f"Failed to connect to {trigger.syncSource} API"
             cursor.execute("""
                 UPDATE SyncConfig 
-                SET syncStatus = 'error', errorMessage = ?, updatedAt = ?
-                WHERE userId = ? AND syncSource = ?
+                SET syncStatus = 'error', errorMessage = %s, updatedAt = %s
+                WHERE userId = %s AND syncSource = %s
             """, (error_msg, datetime.now().isoformat(),
                   trigger.userId, trigger.syncSource))
             
@@ -319,7 +320,7 @@ async def get_sync_history(user_id: int, limit: int = 20):
         # Create SyncHistory table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS SyncHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 syncSource TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -327,16 +328,16 @@ async def get_sync_history(user_id: int, limit: int = 20):
                 recordsUpdated INTEGER DEFAULT 0,
                 errorMessage TEXT,
                 syncDuration REAL,
-                timestamp TEXT NOT NULL,
+                timestamp TIMESTAMPTZ NOT NULL,
                 FOREIGN KEY (userId) REFERENCES User (id)
             )
         """)
         
         cursor.execute("""
             SELECT * FROM SyncHistory 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY timestamp DESC
-            LIMIT ?
+            LIMIT %s
         """, (user_id, limit))
         
         columns = [description[0] for description in cursor.description]
@@ -358,7 +359,7 @@ async def delete_sync_configuration(user_id: int, sync_source: str):
         
         cursor.execute("""
             DELETE FROM SyncConfig 
-            WHERE userId = ? AND syncSource = ?
+            WHERE userId = %s AND syncSource = %s
         """, (user_id, sync_source))
         
         if cursor.rowcount == 0:
@@ -381,4 +382,4 @@ async def delete_sync_configuration(user_id: int, sync_source: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))  

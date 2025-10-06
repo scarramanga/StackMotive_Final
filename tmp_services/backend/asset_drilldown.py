@@ -15,8 +15,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -116,8 +117,8 @@ class AssetStrategyProfile(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -128,7 +129,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_08",
@@ -160,7 +161,7 @@ async def get_asset_details(
         # Create asset details table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetDetails (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
                 asset_class TEXT,
@@ -191,7 +192,7 @@ async def get_asset_details(
         """)
         
         # Get or create asset details
-        cursor.execute("SELECT * FROM AssetDetails WHERE symbol = ?", (symbol.upper(),))
+        cursor.execute("SELECT * FROM AssetDetails WHERE symbol = %s", (symbol.upper(),))
         result = cursor.fetchone()
         
         if not result:
@@ -242,7 +243,7 @@ async def get_asset_details(
                  current_price, market_cap, volume_24h, price_change_24h, price_change_7d,
                  price_change_30d, price_change_1y, beta, volatility, pe_ratio,
                  dividend_yield, sentiment_score, analyst_rating, price_target)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 symbol.upper(), asset_data["name"], asset_data["asset_class"],
                 asset_data["sector"], asset_data["market"], asset_data.get("exchange"),
@@ -259,7 +260,7 @@ async def get_asset_details(
             conn.commit()
             
             # Re-fetch the created record
-            cursor.execute("SELECT * FROM AssetDetails WHERE symbol = ?", (symbol.upper(),))
+            cursor.execute("SELECT * FROM AssetDetails WHERE symbol = %s", (symbol.upper(),))
             result = cursor.fetchone()
         
         columns = [description[0] for description in cursor.description]
@@ -323,7 +324,7 @@ async def get_asset_performance(
         # Create asset performance history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetPerformanceHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 date DATE NOT NULL,
                 open_price REAL NOT NULL,
@@ -342,7 +343,7 @@ async def get_asset_performance(
         # Get performance data
         cursor.execute("""
             SELECT * FROM AssetPerformanceHistory 
-            WHERE symbol = ? AND date >= date('now', '-' || ? || ' days')
+            WHERE symbol = %s AND date >= date('now', '-' || %s || ' days')
             ORDER BY date DESC
         """, (symbol.upper(), days))
         
@@ -354,7 +355,7 @@ async def get_asset_performance(
             import math
             
             # Get base price from asset details
-            cursor.execute("SELECT current_price FROM AssetDetails WHERE symbol = ?", (symbol.upper(),))
+            cursor.execute("SELECT current_price FROM AssetDetails WHERE symbol = %s", (symbol.upper(),))
             base_price_result = cursor.fetchone()
             base_price = base_price_result[0] if base_price_result else 100.0
             
@@ -385,7 +386,7 @@ async def get_asset_performance(
                     INSERT OR IGNORE INTO AssetPerformanceHistory 
                     (symbol, date, open_price, high_price, low_price, close_price, 
                      volume, daily_return, sma_20, rsi)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     symbol.upper(), date_str, open_price, high_price, low_price,
                     close_price, volume, daily_return, sma_20, rsi
@@ -398,7 +399,7 @@ async def get_asset_performance(
             # Re-fetch the created data
             cursor.execute("""
                 SELECT * FROM AssetPerformanceHistory 
-                WHERE symbol = ? AND date >= date('now', '-' || ? || ' days')
+                WHERE symbol = %s AND date >= date('now', '-' || %s || ' days')
                 ORDER BY date DESC
             """, (symbol.upper(), days))
             
@@ -454,7 +455,7 @@ async def get_asset_news(
         # Create asset news events table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetNewsEvents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -474,9 +475,9 @@ async def get_asset_news(
         # Get news data
         cursor.execute("""
             SELECT * FROM AssetNewsEvents 
-            WHERE symbol = ?
+            WHERE symbol = %s
             ORDER BY published_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (symbol.upper(), limit))
         
         results = cursor.fetchall()
@@ -527,7 +528,7 @@ async def get_asset_news(
                     INSERT INTO AssetNewsEvents 
                     (symbol, event_type, title, description, sentiment_impact, price_impact,
                      importance_score, source, category, tags, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     symbol.upper(), news["event_type"], news["title"], news["description"],
                     news["sentiment_impact"], news["price_impact"], news["importance_score"],
@@ -539,9 +540,9 @@ async def get_asset_news(
             # Re-fetch the created data
             cursor.execute("""
                 SELECT * FROM AssetNewsEvents 
-                WHERE symbol = ?
+                WHERE symbol = %s
                 ORDER BY published_at DESC
-                LIMIT ?
+                LIMIT %s
             """, (symbol.upper(), limit))
             
             results = cursor.fetchall()
@@ -599,7 +600,7 @@ async def get_asset_signals(
         # Create asset analysis signals table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetAnalysisSignals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 signal_type TEXT NOT NULL,
                 signal_source TEXT NOT NULL,
@@ -622,9 +623,9 @@ async def get_asset_signals(
         # Get signals data
         cursor.execute("""
             SELECT * FROM AssetAnalysisSignals 
-            WHERE symbol = ? AND is_active = TRUE
+            WHERE symbol = %s AND is_active = TRUE
             ORDER BY generated_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (symbol.upper(), limit))
         
         results = cursor.fetchall()
@@ -668,7 +669,7 @@ async def get_asset_signals(
                     (symbol, signal_type, signal_source, signal_strength, title, description,
                      reasoning, target_price, stop_loss_price, confidence_level, risk_level,
                      time_horizon, current_performance, generated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     symbol.upper(), signal["signal_type"], signal["signal_source"],
                     signal["signal_strength"], signal["title"], signal["description"],
@@ -682,9 +683,9 @@ async def get_asset_signals(
             # Re-fetch the created data
             cursor.execute("""
                 SELECT * FROM AssetAnalysisSignals 
-                WHERE symbol = ? AND is_active = TRUE
+                WHERE symbol = %s AND is_active = TRUE
                 ORDER BY generated_at DESC
-                LIMIT ?
+                LIMIT %s
             """, (symbol.upper(), limit))
             
             results = cursor.fetchall()
@@ -744,7 +745,7 @@ async def get_asset_sentiment(
         
         cursor.execute("""
             SELECT sentiment_score, last_updated FROM AssetDetails 
-            WHERE symbol = ?
+            WHERE symbol = %s
         """, (symbol.upper(),))
         
         result = cursor.fetchone()
@@ -864,7 +865,7 @@ async def track_asset_visit(
         # Create visit history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetVisitHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 visit_duration INTEGER DEFAULT 0,
@@ -880,7 +881,7 @@ async def track_asset_visit(
         cursor.execute("""
             INSERT INTO AssetVisitHistory 
             (userId, symbol, visit_duration, pages_viewed, actions_taken, referrer, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             symbol.upper(),
@@ -917,8 +918,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -1018,8 +1020,8 @@ class AssetStrategyProfile(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -1030,7 +1032,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_08",
@@ -1062,7 +1064,7 @@ async def get_asset_details(
         # Create asset details table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetDetails (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
                 asset_class TEXT,
@@ -1093,7 +1095,7 @@ async def get_asset_details(
         """)
         
         # Get or create asset details
-        cursor.execute("SELECT * FROM AssetDetails WHERE symbol = ?", (symbol.upper(),))
+        cursor.execute("SELECT * FROM AssetDetails WHERE symbol = %s", (symbol.upper(),))
         result = cursor.fetchone()
         
         if not result:
@@ -1144,7 +1146,7 @@ async def get_asset_details(
                  current_price, market_cap, volume_24h, price_change_24h, price_change_7d,
                  price_change_30d, price_change_1y, beta, volatility, pe_ratio,
                  dividend_yield, sentiment_score, analyst_rating, price_target)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 symbol.upper(), asset_data["name"], asset_data["asset_class"],
                 asset_data["sector"], asset_data["market"], asset_data.get("exchange"),
@@ -1161,7 +1163,7 @@ async def get_asset_details(
             conn.commit()
             
             # Re-fetch the created record
-            cursor.execute("SELECT * FROM AssetDetails WHERE symbol = ?", (symbol.upper(),))
+            cursor.execute("SELECT * FROM AssetDetails WHERE symbol = %s", (symbol.upper(),))
             result = cursor.fetchone()
         
         columns = [description[0] for description in cursor.description]
@@ -1225,7 +1227,7 @@ async def get_asset_performance(
         # Create asset performance history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetPerformanceHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 date DATE NOT NULL,
                 open_price REAL NOT NULL,
@@ -1244,7 +1246,7 @@ async def get_asset_performance(
         # Get performance data
         cursor.execute("""
             SELECT * FROM AssetPerformanceHistory 
-            WHERE symbol = ? AND date >= date('now', '-' || ? || ' days')
+            WHERE symbol = %s AND date >= date('now', '-' || %s || ' days')
             ORDER BY date DESC
         """, (symbol.upper(), days))
         
@@ -1256,7 +1258,7 @@ async def get_asset_performance(
             import math
             
             # Get base price from asset details
-            cursor.execute("SELECT current_price FROM AssetDetails WHERE symbol = ?", (symbol.upper(),))
+            cursor.execute("SELECT current_price FROM AssetDetails WHERE symbol = %s", (symbol.upper(),))
             base_price_result = cursor.fetchone()
             base_price = base_price_result[0] if base_price_result else 100.0
             
@@ -1287,7 +1289,7 @@ async def get_asset_performance(
                     INSERT OR IGNORE INTO AssetPerformanceHistory 
                     (symbol, date, open_price, high_price, low_price, close_price, 
                      volume, daily_return, sma_20, rsi)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     symbol.upper(), date_str, open_price, high_price, low_price,
                     close_price, volume, daily_return, sma_20, rsi
@@ -1300,7 +1302,7 @@ async def get_asset_performance(
             # Re-fetch the created data
             cursor.execute("""
                 SELECT * FROM AssetPerformanceHistory 
-                WHERE symbol = ? AND date >= date('now', '-' || ? || ' days')
+                WHERE symbol = %s AND date >= date('now', '-' || %s || ' days')
                 ORDER BY date DESC
             """, (symbol.upper(), days))
             
@@ -1356,7 +1358,7 @@ async def get_asset_news(
         # Create asset news events table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetNewsEvents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -1376,9 +1378,9 @@ async def get_asset_news(
         # Get news data
         cursor.execute("""
             SELECT * FROM AssetNewsEvents 
-            WHERE symbol = ?
+            WHERE symbol = %s
             ORDER BY published_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (symbol.upper(), limit))
         
         results = cursor.fetchall()
@@ -1429,7 +1431,7 @@ async def get_asset_news(
                     INSERT INTO AssetNewsEvents 
                     (symbol, event_type, title, description, sentiment_impact, price_impact,
                      importance_score, source, category, tags, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     symbol.upper(), news["event_type"], news["title"], news["description"],
                     news["sentiment_impact"], news["price_impact"], news["importance_score"],
@@ -1441,9 +1443,9 @@ async def get_asset_news(
             # Re-fetch the created data
             cursor.execute("""
                 SELECT * FROM AssetNewsEvents 
-                WHERE symbol = ?
+                WHERE symbol = %s
                 ORDER BY published_at DESC
-                LIMIT ?
+                LIMIT %s
             """, (symbol.upper(), limit))
             
             results = cursor.fetchall()
@@ -1501,7 +1503,7 @@ async def get_asset_signals(
         # Create asset analysis signals table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetAnalysisSignals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 signal_type TEXT NOT NULL,
                 signal_source TEXT NOT NULL,
@@ -1524,9 +1526,9 @@ async def get_asset_signals(
         # Get signals data
         cursor.execute("""
             SELECT * FROM AssetAnalysisSignals 
-            WHERE symbol = ? AND is_active = TRUE
+            WHERE symbol = %s AND is_active = TRUE
             ORDER BY generated_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (symbol.upper(), limit))
         
         results = cursor.fetchall()
@@ -1570,7 +1572,7 @@ async def get_asset_signals(
                     (symbol, signal_type, signal_source, signal_strength, title, description,
                      reasoning, target_price, stop_loss_price, confidence_level, risk_level,
                      time_horizon, current_performance, generated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     symbol.upper(), signal["signal_type"], signal["signal_source"],
                     signal["signal_strength"], signal["title"], signal["description"],
@@ -1584,9 +1586,9 @@ async def get_asset_signals(
             # Re-fetch the created data
             cursor.execute("""
                 SELECT * FROM AssetAnalysisSignals 
-                WHERE symbol = ? AND is_active = TRUE
+                WHERE symbol = %s AND is_active = TRUE
                 ORDER BY generated_at DESC
-                LIMIT ?
+                LIMIT %s
             """, (symbol.upper(), limit))
             
             results = cursor.fetchall()
@@ -1646,7 +1648,7 @@ async def get_asset_sentiment(
         
         cursor.execute("""
             SELECT sentiment_score, last_updated FROM AssetDetails 
-            WHERE symbol = ?
+            WHERE symbol = %s
         """, (symbol.upper(),))
         
         result = cursor.fetchone()
@@ -1766,7 +1768,7 @@ async def track_asset_visit(
         # Create visit history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetVisitHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 visit_duration INTEGER DEFAULT 0,
@@ -1782,7 +1784,7 @@ async def track_asset_visit(
         cursor.execute("""
             INSERT INTO AssetVisitHistory 
             (userId, symbol, visit_duration, pages_viewed, actions_taken, referrer, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             symbol.upper(),
@@ -1802,4 +1804,4 @@ async def track_asset_visit(
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            

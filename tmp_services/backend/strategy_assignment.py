@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -41,8 +42,8 @@ class StrategyConfig(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Log to Agent Memory Table
 async def log_to_agent_memory(
@@ -59,7 +60,7 @@ async def log_to_agent_memory(
         
         cursor.execute("""
             INSERT INTO AgentMemory (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "2",  # Block 2 - Strategy Assignment Engine
@@ -227,7 +228,7 @@ async def assign_strategy_to_position(user_id: int, position_id: int, symbol: st
         # Create strategy assignments table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyAssignment (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 positionId INTEGER NOT NULL,
                 strategyId TEXT NOT NULL,
@@ -244,9 +245,16 @@ async def assign_strategy_to_position(user_id: int, position_id: int, symbol: st
         
         # Insert or update assignment
         cursor.execute("""
-            INSERT OR REPLACE INTO StrategyAssignment 
+            INSERT INTO StrategyAssignment 
             (userId, positionId, strategyId, strategyName, confidence, reason, assignedAt, metadata, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (userId, positionId) DO UPDATE SET
+                strategyId = EXCLUDED.strategyId,
+                strategyName = EXCLUDED.strategyName,
+                confidence = EXCLUDED.confidence,
+                reason = EXCLUDED.reason,
+                assignedAt = EXCLUDED.assignedAt,
+                metadata = EXCLUDED.metadata
         """, (
             user_id,
             position_id,
@@ -277,7 +285,7 @@ async def auto_assign_strategies(user_id: int):
         # Get all portfolio positions for user
         cursor.execute("""
             SELECT id, symbol, assetClass FROM PortfolioPosition 
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         positions = cursor.fetchall()
@@ -355,7 +363,7 @@ async def get_strategy_assignments(user_id: int):
             SELECT sa.*, pp.symbol, pp.name, pp.quantity, pp.assetClass
             FROM StrategyAssignment sa
             JOIN PortfolioPosition pp ON sa.positionId = pp.id
-            WHERE sa.userId = ?
+            WHERE sa.userId = %s
             ORDER BY sa.assignedAt DESC
         """, (user_id,))
         
@@ -399,8 +407,8 @@ async def update_strategy_assignment(assignment_id: int, strategy_id: str, user_
         # Update assignment
         cursor.execute("""
             UPDATE StrategyAssignment 
-            SET strategyId = ?, strategyName = ?, reason = ?, assignedAt = ?, confidence = ?
-            WHERE id = ? AND userId = ?
+            SET strategyId = %s, strategyName = %s, reason = %s, assignedAt = %s, confidence = %s
+            WHERE id = %s AND userId = %s
         """, (
             strategy_id,
             strategy_config.name,
@@ -447,7 +455,7 @@ async def delete_strategy_assignment(assignment_id: int, user_id: int):
         # Get assignment before deleting
         cursor.execute("""
             SELECT strategyName, positionId FROM StrategyAssignment 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (assignment_id, user_id))
         
         assignment = cursor.fetchone()
@@ -460,7 +468,7 @@ async def delete_strategy_assignment(assignment_id: int, user_id: int):
         # Delete assignment
         cursor.execute("""
             DELETE FROM StrategyAssignment 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (assignment_id, user_id))
         
         conn.commit()
@@ -491,4 +499,4 @@ async def get_assignment_rules():
     try:
         return {"rules": DEFAULT_ASSIGNMENT_RULES}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))        

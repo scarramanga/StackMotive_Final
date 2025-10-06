@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -38,14 +39,8 @@ class StrategyAssignment(BaseModel):
     
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    print(f"Database path: {db_path}")
-    print(f"Database exists: {db_path.exists()}")
-    if not db_path.exists():
-        # Create the database file if it doesn't exist
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        db_path.touch()
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -55,7 +50,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AgentMemory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 blockId TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -71,7 +66,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_5",
@@ -104,14 +99,14 @@ async def get_user_strategy_assignments(user_id: int):
         print(f"DEBUG: Connected to database successfully for user {user_id}")
         
         # Check if the table exists first
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='StrategyAssignment'")
+        cursor.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'strategyassignment'")
         table_exists = cursor.fetchone()
         print(f"DEBUG: StrategyAssignment table exists: {table_exists is not None}")
         
         # Create PortfolioPosition table first if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS PortfolioPosition (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 name TEXT,
@@ -130,7 +125,7 @@ async def get_user_strategy_assignments(user_id: int):
         # Create StrategyAssignment table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyAssignment (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 positionId INTEGER,
                 strategyName TEXT NOT NULL,
@@ -149,7 +144,7 @@ async def get_user_strategy_assignments(user_id: int):
         # Check if user has any strategy assignments
         print(f"DEBUG: About to query StrategyAssignment table for user {user_id}")
         cursor.execute("""
-            SELECT COUNT(*) FROM StrategyAssignment WHERE userId = ?
+            SELECT COUNT(*) FROM StrategyAssignment WHERE userId = %s
         """, (user_id,))
         
         assignment_count = cursor.fetchone()[0]
@@ -183,7 +178,7 @@ async def get_user_strategy_assignments(user_id: int):
                 cursor.execute("""
                     INSERT INTO StrategyAssignment 
                     (userId, strategyName, confidence, metadata, assignedAt)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     strategy["strategyName"],
@@ -213,7 +208,7 @@ async def get_user_strategy_assignments(user_id: int):
                 COALESCE(pp.assetClass, 'Mixed') as assetClass
             FROM StrategyAssignment sa
             LEFT JOIN PortfolioPosition pp ON sa.positionId = pp.id
-            WHERE sa.userId = ?
+            WHERE sa.userId = %s
             ORDER BY sa.assignedAt DESC
         """, (user_id,))
         
@@ -247,7 +242,7 @@ async def get_user_strategy_assignments(user_id: int):
             "user_id": user_id
         }
         
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         print(f"DEBUG: Database error in strategy assignments: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
@@ -267,7 +262,7 @@ async def edit_strategy(strategy_id: int, edit_data: StrategyEdit):
         # Create StrategyEdits table to track changes
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyEdit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 strategyAssignmentId INTEGER NOT NULL,
                 userId INTEGER NOT NULL,
                 assetClassWeights TEXT NOT NULL,
@@ -285,7 +280,7 @@ async def edit_strategy(strategy_id: int, edit_data: StrategyEdit):
         # Check if strategy exists and belongs to user
         cursor.execute("""
             SELECT * FROM StrategyAssignment 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (strategy_id, edit_data.userId))
         
         strategy = cursor.fetchone()
@@ -295,7 +290,7 @@ async def edit_strategy(strategy_id: int, edit_data: StrategyEdit):
         # Get current version number
         cursor.execute("""
             SELECT MAX(version) FROM StrategyEdit 
-            WHERE strategyAssignmentId = ?
+            WHERE strategyAssignmentId = %s
         """, (strategy_id,))
         
         max_version = cursor.fetchone()[0] or 0
@@ -306,7 +301,7 @@ async def edit_strategy(strategy_id: int, edit_data: StrategyEdit):
             INSERT INTO StrategyEdit 
             (strategyAssignmentId, userId, assetClassWeights, rebalanceFrequency, 
              riskTolerance, excludedAssets, notes, editedAt, version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             strategy_id,
             edit_data.userId,
@@ -331,8 +326,8 @@ async def edit_strategy(strategy_id: int, edit_data: StrategyEdit):
         
         cursor.execute("""
             UPDATE StrategyAssignment 
-            SET metadata = ? 
-            WHERE id = ?
+            SET metadata = %s 
+            WHERE id = %s
         """, (json.dumps(updated_metadata), strategy_id))
         
         conn.commit()
@@ -375,7 +370,7 @@ async def get_strategy_edit_history(strategy_id: int):
         
         cursor.execute("""
             SELECT * FROM StrategyEdit 
-            WHERE strategyAssignmentId = ? 
+            WHERE strategyAssignmentId = %s 
             ORDER BY version DESC
         """, (strategy_id,))
         
@@ -445,14 +440,14 @@ async def debug_strategy_assignments(user_id: int):
         print(f"DEBUG: Database connection established")
         
         # Test basic table listing
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        cursor.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
         tables = cursor.fetchall()
         print(f"DEBUG: Available tables: {[table[0] for table in tables]}")
         
         # Try to create the table explicitly
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyAssignment (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 positionId INTEGER,
                 strategyName TEXT NOT NULL,
@@ -466,7 +461,7 @@ async def debug_strategy_assignments(user_id: int):
         print(f"DEBUG: Table creation completed")
         
         # Test if table exists now
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='StrategyAssignment'")
+        cursor.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'strategyassignment'")
         table_check = cursor.fetchone()
         print(f"DEBUG: StrategyAssignment table exists after creation: {table_check is not None}")
         
@@ -491,4 +486,4 @@ async def debug_strategy_assignments(user_id: int):
             "status": "error",
             "error": str(e),
             "user_id": user_id
-        } 
+        }                

@@ -15,8 +15,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -52,8 +53,8 @@ class TagFilter(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -64,7 +65,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_30",
@@ -94,7 +95,7 @@ async def get_asset_tags(user_id: int = 1):
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 color TEXT NOT NULL DEFAULT '#3B82F6',
@@ -112,7 +113,7 @@ async def get_asset_tags(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTagAssignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 asset_symbol TEXT NOT NULL,
                 tag_id INTEGER NOT NULL REFERENCES AssetTags(id),
@@ -142,7 +143,7 @@ async def get_asset_tags(user_id: int = 1):
                 COUNT(DISTINCT a.asset_symbol) as actual_usage_count
             FROM AssetTags t
             LEFT JOIN AssetTagAssignments a ON t.id = a.tag_id AND a.is_active = TRUE
-            WHERE t.userId = ? AND t.is_active = TRUE
+            WHERE t.userId = %s AND t.is_active = TRUE
             GROUP BY t.id
             ORDER BY actual_usage_count DESC, t.name
         """, (user_id,))
@@ -164,7 +165,7 @@ async def get_asset_tags(user_id: int = 1):
             for tag in default_tags:
                 cursor.execute("""
                     INSERT INTO AssetTags (userId, name, color, description, is_system_tag)
-                    VALUES (?, ?, ?, ?, TRUE)
+                    VALUES (%s, %s, %s, %s, TRUE)
                 """, (user_id, tag["name"], tag["color"], tag["description"]))
             
             conn.commit()
@@ -243,7 +244,7 @@ async def create_asset_tag(
         # Insert the tag
         cursor.execute("""
             INSERT INTO AssetTags (userId, name, color, description, sort_order)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
         """, (
             user_id,
             tag.name,
@@ -298,8 +299,8 @@ async def update_asset_tag(
         # Update the tag
         cursor.execute("""
             UPDATE AssetTags 
-            SET name = ?, color = ?, description = ?, sort_order = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            SET name = %s, color = %s, description = %s, sort_order = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND userId = %s
         """, (
             tag.name,
             tag.color,
@@ -343,17 +344,17 @@ async def delete_asset_tag(
         cursor = conn.cursor()
         
         # Get tag name for logging
-        cursor.execute("SELECT name FROM AssetTags WHERE id = ? AND userId = ?", (int(tag_id), user_id))
+        cursor.execute("SELECT name FROM AssetTags WHERE id = %s AND userId = %s", (int(tag_id), user_id))
         tag_name = cursor.fetchone()
         
         if not tag_name:
             raise HTTPException(status_code=404, detail="Tag not found")
         
         # Delete assignments first
-        cursor.execute("DELETE FROM AssetTagAssignments WHERE tag_id = ? AND userId = ?", (int(tag_id), user_id))
+        cursor.execute("DELETE FROM AssetTagAssignments WHERE tag_id = %s AND userId = %s", (int(tag_id), user_id))
         
         # Delete the tag
-        cursor.execute("DELETE FROM AssetTags WHERE id = ? AND userId = ?", (int(tag_id), user_id))
+        cursor.execute("DELETE FROM AssetTags WHERE id = %s AND userId = %s", (int(tag_id), user_id))
         
         conn.commit()
         conn.close()
@@ -390,7 +391,7 @@ async def assign_asset_tag(
         cursor.execute("""
             INSERT OR REPLACE INTO AssetTagAssignments 
             (userId, asset_symbol, tag_id, assigned_by, assignment_reason, confidence_score, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, TRUE)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE)
         """, (
             user_id,
             assignment.assetSymbol,
@@ -406,9 +407,9 @@ async def assign_asset_tag(
             SET usage_count = (
                 SELECT COUNT(DISTINCT asset_symbol) 
                 FROM AssetTagAssignments 
-                WHERE tag_id = ? AND is_active = TRUE
+                WHERE tag_id = %s AND is_active = TRUE
             )
-            WHERE id = ?
+            WHERE id = %s
         """, (int(assignment.tagId), int(assignment.tagId)))
         
         conn.commit()
@@ -445,7 +446,7 @@ async def unassign_asset_tag(
         # Delete the assignment
         cursor.execute("""
             DELETE FROM AssetTagAssignments 
-            WHERE userId = ? AND asset_symbol = ? AND tag_id = ?
+            WHERE userId = %s AND asset_symbol = %s AND tag_id = %s
         """, (user_id, asset_symbol, int(tag_id)))
         
         if cursor.rowcount == 0:
@@ -503,7 +504,7 @@ async def get_asset_tags(
                 a.confidence_score
             FROM AssetTags t
             INNER JOIN AssetTagAssignments a ON t.id = a.tag_id
-            WHERE a.userId = ? AND a.asset_symbol = ? AND a.is_active = TRUE
+            WHERE a.userId = %s AND a.asset_symbol = %s AND a.is_active = TRUE
             ORDER BY a.assigned_at DESC
         """, (user_id, asset_symbol))
         
@@ -563,7 +564,7 @@ async def get_tagged_assets(
                 t.name as tag_name
             FROM AssetTagAssignments a
             INNER JOIN AssetTags t ON a.tag_id = t.id
-            WHERE a.userId = ? AND a.tag_id = ? AND a.is_active = TRUE
+            WHERE a.userId = %s AND a.tag_id = %s AND a.is_active = TRUE
             ORDER BY a.assigned_at DESC
         """, (user_id, int(tag_id)))
         
@@ -627,7 +628,7 @@ async def bulk_assign_tags(
                 cursor.execute("""
                     INSERT OR REPLACE INTO AssetTagAssignments 
                     (userId, asset_symbol, tag_id, assigned_by, is_active)
-                    VALUES (?, ?, ?, ?, TRUE)
+                    VALUES (%s, %s, %s, %s, TRUE)
                 """, (user_id, asset_symbol, int(tag_id), assigned_by))
                 assignments_created += 1
         
@@ -674,7 +675,7 @@ async def get_tag_filters(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TagFilters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 include_tags TEXT DEFAULT '[]',
@@ -687,7 +688,7 @@ async def get_tag_filters(user_id: int = 1):
         
         cursor.execute("""
             SELECT * FROM TagFilters 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY name
         """, (user_id,))
         
@@ -729,7 +730,7 @@ async def create_tag_filter(
         
         cursor.execute("""
             INSERT INTO TagFilters (userId, name, include_tags, exclude_tags, operator)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
         """, (
             user_id,
             filter_data.name,
@@ -775,7 +776,7 @@ async def get_tagging_statistics(user_id: int = 1):
                 COUNT(CASE WHEN is_system_tag = TRUE THEN 1 END) as system_tags,
                 COUNT(CASE WHEN is_system_tag = FALSE THEN 1 END) as custom_tags
             FROM AssetTags 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         tag_stats = cursor.fetchone()
@@ -787,7 +788,7 @@ async def get_tagging_statistics(user_id: int = 1):
                 COUNT(*) as total_assignments,
                 AVG(confidence_score) as avg_confidence
             FROM AssetTagAssignments 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         assignment_stats = cursor.fetchone()
@@ -800,7 +801,7 @@ async def get_tagging_statistics(user_id: int = 1):
                 COUNT(DISTINCT a.asset_symbol) as usage_count
             FROM AssetTags t
             LEFT JOIN AssetTagAssignments a ON t.id = a.tag_id AND a.is_active = TRUE
-            WHERE t.userId = ? AND t.is_active = TRUE
+            WHERE t.userId = %s AND t.is_active = TRUE
             GROUP BY t.id
             ORDER BY usage_count DESC
             LIMIT 5
@@ -845,7 +846,7 @@ async def export_tagging_data(user_id: int = 1):
         # Get all tags
         cursor.execute("""
             SELECT * FROM AssetTags 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         tags = cursor.fetchall()
@@ -854,7 +855,7 @@ async def export_tagging_data(user_id: int = 1):
         # Get all assignments
         cursor.execute("""
             SELECT * FROM AssetTagAssignments 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         assignments = cursor.fetchall()
@@ -903,7 +904,7 @@ async def import_tagging_data(
             cursor.execute("""
                 INSERT OR IGNORE INTO AssetTags 
                 (userId, name, color, description, is_system_tag, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 tag_data["name"],
@@ -921,7 +922,7 @@ async def import_tagging_data(
             # Get tag ID by name
             cursor.execute("""
                 SELECT id FROM AssetTags 
-                WHERE userId = ? AND name = ?
+                WHERE userId = %s AND name = %s
             """, (user_id, assignment_data.get("tag_name")))
             
             tag_result = cursor.fetchone()
@@ -929,7 +930,7 @@ async def import_tagging_data(
                 cursor.execute("""
                     INSERT OR IGNORE INTO AssetTagAssignments 
                     (userId, asset_symbol, tag_id, assigned_by, confidence_score)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     assignment_data["asset_symbol"],
@@ -977,8 +978,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -1014,8 +1016,8 @@ class TagFilter(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -1026,7 +1028,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_30",
@@ -1056,7 +1058,7 @@ async def get_asset_tags(user_id: int = 1):
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 color TEXT NOT NULL DEFAULT '#3B82F6',
@@ -1074,7 +1076,7 @@ async def get_asset_tags(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTagAssignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 asset_symbol TEXT NOT NULL,
                 tag_id INTEGER NOT NULL REFERENCES AssetTags(id),
@@ -1104,7 +1106,7 @@ async def get_asset_tags(user_id: int = 1):
                 COUNT(DISTINCT a.asset_symbol) as actual_usage_count
             FROM AssetTags t
             LEFT JOIN AssetTagAssignments a ON t.id = a.tag_id AND a.is_active = TRUE
-            WHERE t.userId = ? AND t.is_active = TRUE
+            WHERE t.userId = %s AND t.is_active = TRUE
             GROUP BY t.id
             ORDER BY actual_usage_count DESC, t.name
         """, (user_id,))
@@ -1126,7 +1128,7 @@ async def get_asset_tags(user_id: int = 1):
             for tag in default_tags:
                 cursor.execute("""
                     INSERT INTO AssetTags (userId, name, color, description, is_system_tag)
-                    VALUES (?, ?, ?, ?, TRUE)
+                    VALUES (%s, %s, %s, %s, TRUE)
                 """, (user_id, tag["name"], tag["color"], tag["description"]))
             
             conn.commit()
@@ -1205,7 +1207,7 @@ async def create_asset_tag(
         # Insert the tag
         cursor.execute("""
             INSERT INTO AssetTags (userId, name, color, description, sort_order)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
         """, (
             user_id,
             tag.name,
@@ -1260,8 +1262,8 @@ async def update_asset_tag(
         # Update the tag
         cursor.execute("""
             UPDATE AssetTags 
-            SET name = ?, color = ?, description = ?, sort_order = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            SET name = %s, color = %s, description = %s, sort_order = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND userId = %s
         """, (
             tag.name,
             tag.color,
@@ -1305,17 +1307,17 @@ async def delete_asset_tag(
         cursor = conn.cursor()
         
         # Get tag name for logging
-        cursor.execute("SELECT name FROM AssetTags WHERE id = ? AND userId = ?", (int(tag_id), user_id))
+        cursor.execute("SELECT name FROM AssetTags WHERE id = %s AND userId = %s", (int(tag_id), user_id))
         tag_name = cursor.fetchone()
         
         if not tag_name:
             raise HTTPException(status_code=404, detail="Tag not found")
         
         # Delete assignments first
-        cursor.execute("DELETE FROM AssetTagAssignments WHERE tag_id = ? AND userId = ?", (int(tag_id), user_id))
+        cursor.execute("DELETE FROM AssetTagAssignments WHERE tag_id = %s AND userId = %s", (int(tag_id), user_id))
         
         # Delete the tag
-        cursor.execute("DELETE FROM AssetTags WHERE id = ? AND userId = ?", (int(tag_id), user_id))
+        cursor.execute("DELETE FROM AssetTags WHERE id = %s AND userId = %s", (int(tag_id), user_id))
         
         conn.commit()
         conn.close()
@@ -1352,7 +1354,7 @@ async def assign_asset_tag(
         cursor.execute("""
             INSERT OR REPLACE INTO AssetTagAssignments 
             (userId, asset_symbol, tag_id, assigned_by, assignment_reason, confidence_score, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, TRUE)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE)
         """, (
             user_id,
             assignment.assetSymbol,
@@ -1368,9 +1370,9 @@ async def assign_asset_tag(
             SET usage_count = (
                 SELECT COUNT(DISTINCT asset_symbol) 
                 FROM AssetTagAssignments 
-                WHERE tag_id = ? AND is_active = TRUE
+                WHERE tag_id = %s AND is_active = TRUE
             )
-            WHERE id = ?
+            WHERE id = %s
         """, (int(assignment.tagId), int(assignment.tagId)))
         
         conn.commit()
@@ -1407,7 +1409,7 @@ async def unassign_asset_tag(
         # Delete the assignment
         cursor.execute("""
             DELETE FROM AssetTagAssignments 
-            WHERE userId = ? AND asset_symbol = ? AND tag_id = ?
+            WHERE userId = %s AND asset_symbol = %s AND tag_id = %s
         """, (user_id, asset_symbol, int(tag_id)))
         
         if cursor.rowcount == 0:
@@ -1465,7 +1467,7 @@ async def get_asset_tags(
                 a.confidence_score
             FROM AssetTags t
             INNER JOIN AssetTagAssignments a ON t.id = a.tag_id
-            WHERE a.userId = ? AND a.asset_symbol = ? AND a.is_active = TRUE
+            WHERE a.userId = %s AND a.asset_symbol = %s AND a.is_active = TRUE
             ORDER BY a.assigned_at DESC
         """, (user_id, asset_symbol))
         
@@ -1525,7 +1527,7 @@ async def get_tagged_assets(
                 t.name as tag_name
             FROM AssetTagAssignments a
             INNER JOIN AssetTags t ON a.tag_id = t.id
-            WHERE a.userId = ? AND a.tag_id = ? AND a.is_active = TRUE
+            WHERE a.userId = %s AND a.tag_id = %s AND a.is_active = TRUE
             ORDER BY a.assigned_at DESC
         """, (user_id, int(tag_id)))
         
@@ -1589,7 +1591,7 @@ async def bulk_assign_tags(
                 cursor.execute("""
                     INSERT OR REPLACE INTO AssetTagAssignments 
                     (userId, asset_symbol, tag_id, assigned_by, is_active)
-                    VALUES (?, ?, ?, ?, TRUE)
+                    VALUES (%s, %s, %s, %s, TRUE)
                 """, (user_id, asset_symbol, int(tag_id), assigned_by))
                 assignments_created += 1
         
@@ -1636,7 +1638,7 @@ async def get_tag_filters(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TagFilters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 include_tags TEXT DEFAULT '[]',
@@ -1649,7 +1651,7 @@ async def get_tag_filters(user_id: int = 1):
         
         cursor.execute("""
             SELECT * FROM TagFilters 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY name
         """, (user_id,))
         
@@ -1691,7 +1693,7 @@ async def create_tag_filter(
         
         cursor.execute("""
             INSERT INTO TagFilters (userId, name, include_tags, exclude_tags, operator)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
         """, (
             user_id,
             filter_data.name,
@@ -1737,7 +1739,7 @@ async def get_tagging_statistics(user_id: int = 1):
                 COUNT(CASE WHEN is_system_tag = TRUE THEN 1 END) as system_tags,
                 COUNT(CASE WHEN is_system_tag = FALSE THEN 1 END) as custom_tags
             FROM AssetTags 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         tag_stats = cursor.fetchone()
@@ -1749,7 +1751,7 @@ async def get_tagging_statistics(user_id: int = 1):
                 COUNT(*) as total_assignments,
                 AVG(confidence_score) as avg_confidence
             FROM AssetTagAssignments 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         assignment_stats = cursor.fetchone()
@@ -1762,7 +1764,7 @@ async def get_tagging_statistics(user_id: int = 1):
                 COUNT(DISTINCT a.asset_symbol) as usage_count
             FROM AssetTags t
             LEFT JOIN AssetTagAssignments a ON t.id = a.tag_id AND a.is_active = TRUE
-            WHERE t.userId = ? AND t.is_active = TRUE
+            WHERE t.userId = %s AND t.is_active = TRUE
             GROUP BY t.id
             ORDER BY usage_count DESC
             LIMIT 5
@@ -1807,7 +1809,7 @@ async def export_tagging_data(user_id: int = 1):
         # Get all tags
         cursor.execute("""
             SELECT * FROM AssetTags 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         tags = cursor.fetchall()
@@ -1816,7 +1818,7 @@ async def export_tagging_data(user_id: int = 1):
         # Get all assignments
         cursor.execute("""
             SELECT * FROM AssetTagAssignments 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         assignments = cursor.fetchall()
@@ -1865,7 +1867,7 @@ async def import_tagging_data(
             cursor.execute("""
                 INSERT OR IGNORE INTO AssetTags 
                 (userId, name, color, description, is_system_tag, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 tag_data["name"],
@@ -1883,7 +1885,7 @@ async def import_tagging_data(
             # Get tag ID by name
             cursor.execute("""
                 SELECT id FROM AssetTags 
-                WHERE userId = ? AND name = ?
+                WHERE userId = %s AND name = %s
             """, (user_id, assignment_data.get("tag_name")))
             
             tag_result = cursor.fetchone()
@@ -1891,7 +1893,7 @@ async def import_tagging_data(
                 cursor.execute("""
                     INSERT OR IGNORE INTO AssetTagAssignments 
                     (userId, asset_symbol, tag_id, assigned_by, confidence_score)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     assignment_data["asset_symbol"],
@@ -1922,4 +1924,4 @@ async def import_tagging_data(
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            

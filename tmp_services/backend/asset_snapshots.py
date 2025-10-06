@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 from decimal import Decimal
 
 router = APIRouter()
@@ -48,8 +49,8 @@ class SnapshotRetentionPolicy(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -60,7 +61,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_47",
@@ -89,7 +90,7 @@ async def create_asset_snapshot(user_id: int, snapshot: AssetSnapshot):
         # Create asset snapshots table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetSnapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 asset_name TEXT,
@@ -117,7 +118,7 @@ async def create_asset_snapshot(user_id: int, snapshot: AssetSnapshot):
             (userId, symbol, asset_name, asset_class, sector, market, quantity, 
              price_per_unit, market_value, cost_basis, target_allocation_percent, 
              actual_allocation_percent, snapshot_type, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             snapshot.symbol,
@@ -178,26 +179,26 @@ async def get_asset_snapshots(
         cursor = conn.cursor()
         
         # Build query with filters
-        query = "SELECT * FROM AssetSnapshots WHERE userId = ?"
+        query = "SELECT * FROM AssetSnapshots WHERE userId = %s"
         params = [user_id]
         
         if symbol:
-            query += " AND symbol = ?"
+            query += " AND symbol = %s"
             params.append(symbol)
         
         if snapshot_type:
-            query += " AND snapshot_type = ?"
+            query += " AND snapshot_type = %s"
             params.append(snapshot_type)
         
         if start_date:
-            query += " AND snapshot_timestamp >= ?"
+            query += " AND snapshot_timestamp >= %s"
             params.append(start_date)
         
         if end_date:
-            query += " AND snapshot_timestamp <= ?"
+            query += " AND snapshot_timestamp <= %s"
             params.append(end_date)
         
-        query += " ORDER BY snapshot_timestamp DESC LIMIT ?"
+        query += " ORDER BY snapshot_timestamp DESC LIMIT %s"
         params.append(limit)
         
         cursor.execute(query, params)
@@ -250,7 +251,7 @@ async def create_portfolio_snapshot(user_id: int, snapshot: PortfolioSnapshot):
         # Create portfolio snapshots table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS PortfolioSnapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 total_market_value REAL NOT NULL,
                 total_positions INTEGER NOT NULL,
@@ -273,7 +274,7 @@ async def create_portfolio_snapshot(user_id: int, snapshot: PortfolioSnapshot):
              portfolio_week_change_percent, portfolio_month_change_percent, 
              diversification_score, concentration_risk, asset_class_breakdown, 
              snapshot_type, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             snapshot.total_market_value,
@@ -331,22 +332,22 @@ async def get_portfolio_snapshots(
         cursor = conn.cursor()
         
         # Build query with filters
-        query = "SELECT * FROM PortfolioSnapshots WHERE userId = ?"
+        query = "SELECT * FROM PortfolioSnapshots WHERE userId = %s"
         params = [user_id]
         
         if snapshot_type:
-            query += " AND snapshot_type = ?"
+            query += " AND snapshot_type = %s"
             params.append(snapshot_type)
         
         if start_date:
-            query += " AND snapshot_timestamp >= ?"
+            query += " AND snapshot_timestamp >= %s"
             params.append(start_date)
         
         if end_date:
-            query += " AND snapshot_timestamp <= ?"
+            query += " AND snapshot_timestamp <= %s"
             params.append(end_date)
         
-        query += " ORDER BY snapshot_timestamp DESC LIMIT ?"
+        query += " ORDER BY snapshot_timestamp DESC LIMIT %s"
         params.append(limit)
         
         cursor.execute(query, params)
@@ -411,7 +412,7 @@ async def get_snapshot_analytics(
                     MIN(snapshot_timestamp) as first_snapshot,
                     MAX(snapshot_timestamp) as last_snapshot
                 FROM AssetSnapshots 
-                WHERE userId = ? AND symbol = ? AND snapshot_timestamp >= ?
+                WHERE userId = %s AND symbol = %s AND snapshot_timestamp >= %s
                 GROUP BY symbol
             """, (user_id, symbol, start_date))
         else:
@@ -425,7 +426,7 @@ async def get_snapshot_analytics(
                     MIN(snapshot_timestamp) as first_snapshot,
                     MAX(snapshot_timestamp) as last_snapshot
                 FROM AssetSnapshots 
-                WHERE userId = ? AND snapshot_timestamp >= ?
+                WHERE userId = %s AND snapshot_timestamp >= %s
             """, (user_id, start_date))
         
         result = cursor.fetchone()
@@ -440,7 +441,7 @@ async def get_snapshot_analytics(
                 SUM(market_value) as total_value,
                 AVG(market_value) as avg_value
             FROM AssetSnapshots 
-            WHERE userId = ? AND snapshot_timestamp >= ?
+            WHERE userId = %s AND snapshot_timestamp >= %s
             GROUP BY asset_class
             ORDER BY total_value DESC
         """, (user_id, start_date))
@@ -490,13 +491,13 @@ async def cleanup_snapshots(
         cutoff_date = (datetime.now() - timedelta(days=older_than_days)).isoformat()
         
         # Build cleanup query
-        asset_query = "DELETE FROM AssetSnapshots WHERE userId = ? AND snapshot_timestamp < ?"
-        portfolio_query = "DELETE FROM PortfolioSnapshots WHERE userId = ? AND snapshot_timestamp < ?"
+        asset_query = "DELETE FROM AssetSnapshots WHERE userId = %s AND snapshot_timestamp < %s"
+        portfolio_query = "DELETE FROM PortfolioSnapshots WHERE userId = %s AND snapshot_timestamp < %s"
         params = [user_id, cutoff_date]
         
         if snapshot_type:
-            asset_query += " AND snapshot_type = ?"
-            portfolio_query += " AND snapshot_type = ?"
+            asset_query += " AND snapshot_type = %s"
+            portfolio_query += " AND snapshot_type = %s"
             params.append(snapshot_type)
         
         # Execute cleanup
@@ -532,4 +533,4 @@ async def cleanup_snapshots(
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))          

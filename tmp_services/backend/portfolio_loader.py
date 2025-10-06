@@ -5,9 +5,9 @@ import pandas as pd
 import json
 from datetime import datetime
 from decimal import Decimal
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
-from pathlib import Path
 
 router = APIRouter()
 
@@ -56,8 +56,8 @@ class ManualPositionRequest(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Log to Agent Memory Table
 async def log_to_agent_memory(
@@ -74,7 +74,7 @@ async def log_to_agent_memory(
         
         cursor.execute("""
             INSERT INTO AgentMemory (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "1",  # Block 1 - Portfolio Loader
@@ -108,7 +108,7 @@ async def log_portfolio_sync(
         cursor.execute("""
             INSERT INTO PortfolioSyncLog 
             (userId, syncSource, status, recordsImported, errorMessage, filename, syncStarted, syncCompleted, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             sync_source,
@@ -170,7 +170,7 @@ async def get_portfolio_positions(user_id: int) -> List[Dict[str, Any]]:
     
     cursor.execute("""
         SELECT * FROM PortfolioPosition 
-        WHERE userId = ? 
+        WHERE userId = %s 
         ORDER BY lastUpdated DESC
     """, (user_id,))
     
@@ -191,7 +191,7 @@ async def save_portfolio_positions(user_id: int, positions: List[PortfolioPositi
             # Check if position already exists
             cursor.execute("""
                 SELECT id FROM PortfolioPosition 
-                WHERE userId = ? AND symbol = ? AND account = ?
+                WHERE userId = %s AND symbol = %s AND account = %s
             """, (user_id, position.symbol, position.account))
             
             existing = cursor.fetchone()
@@ -200,9 +200,9 @@ async def save_portfolio_positions(user_id: int, positions: List[PortfolioPositi
                 # Update existing position
                 cursor.execute("""
                     UPDATE PortfolioPosition 
-                    SET name = ?, quantity = ?, avgPrice = ?, currentPrice = ?, 
-                        assetClass = ?, currency = ?, syncSource = ?, lastUpdated = ?
-                    WHERE id = ?
+                    SET name = %s, quantity = %s, avgPrice = %s, currentPrice = %s, 
+                        assetClass = %s, currency = %s, syncSource = %s, lastUpdated = %s
+                    WHERE id = %s
                 """, (
                     position.name, position.quantity, position.avgPrice, position.currentPrice,
                     position.assetClass, position.currency, position.syncSource, 
@@ -215,7 +215,7 @@ async def save_portfolio_positions(user_id: int, positions: List[PortfolioPositi
                     INSERT INTO PortfolioPosition 
                     (userId, symbol, name, quantity, avgPrice, currentPrice, assetClass, 
                      account, currency, syncSource, lastUpdated, createdAt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, position.symbol, position.name, position.quantity, position.avgPrice,
                     position.currentPrice, position.assetClass, position.account, position.currency,
@@ -365,7 +365,7 @@ async def update_position(position_id: int, updates: Dict[str, Any]):
         cursor = conn.cursor()
         
         # Get current position
-        cursor.execute("SELECT * FROM PortfolioPosition WHERE id = ?", (position_id,))
+        cursor.execute("SELECT * FROM PortfolioPosition WHERE id = %s", (position_id,))
         position = cursor.fetchone()
         
         if not position:
@@ -377,20 +377,20 @@ async def update_position(position_id: int, updates: Dict[str, Any]):
         
         for field, value in updates.items():
             if field in ['symbol', 'name', 'quantity', 'avgPrice', 'currentPrice', 'assetClass', 'currency']:
-                update_fields.append(f"{field} = ?")
+                update_fields.append(f"{field} = %s")
                 update_values.append(value)
         
         if update_fields:
-            update_fields.append("lastUpdated = ?")
+            update_fields.append("lastUpdated = %s")
             update_values.append(datetime.now().isoformat())
             update_values.append(position_id)
             
-            query = f"UPDATE PortfolioPosition SET {', '.join(update_fields)} WHERE id = ?"
+            query = f"UPDATE PortfolioPosition SET {', '.join(update_fields)} WHERE id = %s"
             cursor.execute(query, update_values)
             conn.commit()
         
         # Get updated position
-        cursor.execute("SELECT * FROM PortfolioPosition WHERE id = ?", (position_id,))
+        cursor.execute("SELECT * FROM PortfolioPosition WHERE id = %s", (position_id,))
         updated = cursor.fetchone()
         columns = [description[0] for description in cursor.description]
         updated_position = dict(zip(columns, updated))
@@ -421,7 +421,7 @@ async def delete_position(position_id: int):
         cursor = conn.cursor()
         
         # Get position before deleting
-        cursor.execute("SELECT * FROM PortfolioPosition WHERE id = ?", (position_id,))
+        cursor.execute("SELECT * FROM PortfolioPosition WHERE id = %s", (position_id,))
         position = cursor.fetchone()
         
         if not position:
@@ -431,7 +431,7 @@ async def delete_position(position_id: int):
         position_dict = dict(zip(columns, position))
         
         # Delete position
-        cursor.execute("DELETE FROM PortfolioPosition WHERE id = ?", (position_id,))
+        cursor.execute("DELETE FROM PortfolioPosition WHERE id = %s", (position_id,))
         conn.commit()
         conn.close()
         
@@ -461,7 +461,7 @@ async def get_sync_status(user_id: int):
         
         cursor.execute("""
             SELECT * FROM PortfolioSyncLog 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY syncStarted DESC 
             LIMIT 1
         """, (user_id,))
@@ -479,4 +479,4 @@ async def get_sync_status(user_id: int):
         return {"syncStatus": sync_status}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))        

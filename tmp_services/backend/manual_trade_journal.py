@@ -15,8 +15,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -159,8 +160,8 @@ class JournalStatistics(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -171,7 +172,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_13",
@@ -206,7 +207,7 @@ async def get_journal_entries(
         # Create journal entries table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS JournalEntries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 title TEXT,
                 content TEXT NOT NULL,
@@ -236,22 +237,22 @@ async def get_journal_entries(
         """)
         
         # Build query with filters
-        where_clause = "WHERE userId = ?"
+        where_clause = "WHERE userId = %s"
         params = [user_id]
         
         if entry_type:
-            where_clause += " AND entry_type = ?"
+            where_clause += " AND entry_type = %s"
             params.append(entry_type)
         
         if asset_symbol:
-            where_clause += " AND asset_symbol = ?"
+            where_clause += " AND asset_symbol = %s"
             params.append(asset_symbol.upper())
         
         cursor.execute(f"""
             SELECT * FROM JournalEntries 
             {where_clause}
             ORDER BY entry_date DESC, created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, params + [limit])
         
         results = cursor.fetchall()
@@ -303,7 +304,7 @@ async def get_journal_entries(
                     (userId, title, content, entry_type, asset_symbol, trade_type,
                      entry_price, quantity, strategy_used, reasoning, confidence_level,
                      expected_outcome, lessons_learned, tags, mood, market_phase)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, entry["title"], entry["content"], entry["entry_type"],
                     entry.get("asset_symbol"), entry.get("trade_type"), entry.get("entry_price"),
@@ -320,7 +321,7 @@ async def get_journal_entries(
                 SELECT * FROM JournalEntries 
                 {where_clause}
                 ORDER BY entry_date DESC, created_at DESC
-                LIMIT ?
+                LIMIT %s
             """, params + [limit])
             
             results = cursor.fetchall()
@@ -394,7 +395,7 @@ async def create_journal_entry(
              entry_price, exit_price, quantity, strategy_used, reasoning,
              market_conditions, confidence_level, expected_outcome, actual_outcome,
              success_rating, lessons_learned, tags, mood, market_phase, is_public)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             entry.get("title"),
@@ -455,13 +456,13 @@ async def update_journal_entry(
         # Update the journal entry
         cursor.execute("""
             UPDATE JournalEntries 
-            SET title = ?, content = ?, entry_type = ?, asset_symbol = ?,
-                trade_type = ?, entry_price = ?, exit_price = ?, quantity = ?,
-                strategy_used = ?, reasoning = ?, market_conditions = ?,
-                confidence_level = ?, expected_outcome = ?, actual_outcome = ?,
-                success_rating = ?, lessons_learned = ?, tags = ?, mood = ?,
-                market_phase = ?, is_public = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            SET title = %s, content = %s, entry_type = %s, asset_symbol = %s,
+                trade_type = %s, entry_price = %s, exit_price = %s, quantity = %s,
+                strategy_used = %s, reasoning = %s, market_conditions = %s,
+                confidence_level = %s, expected_outcome = %s, actual_outcome = %s,
+                success_rating = %s, lessons_learned = %s, tags = %s, mood = %s,
+                market_phase = %s, is_public = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND userId = %s
         """, (
             entry.get("title"),
             entry["content"],
@@ -523,7 +524,7 @@ async def get_trade_logs(
         # Create manual trade logs table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ManualTradeLogs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 journal_entry_id INTEGER,
                 symbol TEXT NOT NULL,
@@ -566,22 +567,22 @@ async def get_trade_logs(
         """)
         
         # Build query with filters
-        where_clause = "WHERE userId = ?"
+        where_clause = "WHERE userId = %s"
         params = [user_id]
         
         if status:
-            where_clause += " AND status = ?"
+            where_clause += " AND status = %s"
             params.append(status)
         
         if symbol:
-            where_clause += " AND symbol = ?"
+            where_clause += " AND symbol = %s"
             params.append(symbol.upper())
         
         cursor.execute(f"""
             SELECT * FROM ManualTradeLogs 
             {where_clause}
             ORDER BY trade_date DESC, execution_time DESC
-            LIMIT ?
+            LIMIT %s
         """, params + [limit])
         
         results = cursor.fetchall()
@@ -617,7 +618,7 @@ async def get_trade_logs(
                      target_price, stop_loss_price, strategy, conviction_level, market_conditions,
                      technical_indicators, current_price, unrealized_pnl, unrealized_pnl_percent,
                      exit_price, exit_date, exit_reason, realized_pnl, realized_pnl_percent, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, trade["symbol"], trade["asset_name"], trade["trade_type"],
                     trade["entry_price"], trade["quantity"], trade["total_value"],
@@ -635,7 +636,7 @@ async def get_trade_logs(
                 SELECT * FROM ManualTradeLogs 
                 {where_clause}
                 ORDER BY trade_date DESC, execution_time DESC
-                LIMIT ?
+                LIMIT %s
             """, params + [limit])
             
             results = cursor.fetchall()
@@ -723,7 +724,7 @@ async def create_trade_log(
             (userId, symbol, asset_name, trade_type, entry_price, quantity, total_value,
              order_type, fees, broker, account_type, target_price, stop_loss_price,
              strategy, time_horizon, conviction_level, market_conditions)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             trade["symbol"].upper(),
@@ -780,7 +781,7 @@ async def close_trade_log(
         # Get the trade to calculate P&L
         cursor.execute("""
             SELECT * FROM ManualTradeLogs 
-            WHERE id = ? AND userId = ? AND status = 'open'
+            WHERE id = %s AND userId = %s AND status = 'open'
         """, (trade_id, user_id))
         
         trade = cursor.fetchone()
@@ -804,10 +805,10 @@ async def close_trade_log(
         # Update the trade
         cursor.execute("""
             UPDATE ManualTradeLogs 
-            SET exit_price = ?, exit_date = CURRENT_DATE, exit_reason = ?,
-                realized_pnl = ?, realized_pnl_percent = ?, status = 'closed',
+            SET exit_price = %s, exit_date = CURRENT_DATE, exit_reason = %s,
+                realized_pnl = %s, realized_pnl_percent = %s, status = 'closed',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (
             exit_price, exit_reason, realized_pnl, realized_pnl_percent, trade_id, user_id
         ))
@@ -865,7 +866,7 @@ async def get_journal_statistics(
                 COUNT(CASE WHEN entry_type = 'trade' THEN 1 END) as trade_entries,
                 COUNT(CASE WHEN entry_type = 'analysis' THEN 1 END) as analysis_entries
             FROM JournalEntries
-            WHERE userId = ? AND entry_date BETWEEN ? AND ?
+            WHERE userId = %s AND entry_date BETWEEN %s AND %s
         """, (user_id, start_date, end_date))
         
         journal_stats = cursor.fetchone()
@@ -882,7 +883,7 @@ async def get_journal_statistics(
                 COALESCE(MAX(realized_pnl), 0) as largest_win,
                 COALESCE(MIN(realized_pnl), 0) as largest_loss
             FROM ManualTradeLogs
-            WHERE userId = ? AND trade_date BETWEEN ? AND ? AND status = 'closed'
+            WHERE userId = %s AND trade_date BETWEEN %s AND %s AND status = 'closed'
         """, (user_id, start_date, end_date))
         
         trade_stats = cursor.fetchone()
@@ -941,19 +942,19 @@ async def export_journal_data(
         cursor = conn.cursor()
         
         # Build query
-        where_clause = "WHERE userId = ?"
+        where_clause = "WHERE userId = %s"
         params = [user_id]
         
         if entry_type:
-            where_clause += " AND entry_type = ?"
+            where_clause += " AND entry_type = %s"
             params.append(entry_type)
         
         if start_date:
-            where_clause += " AND entry_date >= ?"
+            where_clause += " AND entry_date >= %s"
             params.append(start_date)
         
         if end_date:
-            where_clause += " AND entry_date <= ?"
+            where_clause += " AND entry_date <= %s"
             params.append(end_date)
         
         cursor.execute(f"""
@@ -1039,8 +1040,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -1183,8 +1185,8 @@ class JournalStatistics(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -1195,7 +1197,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_13",
@@ -1230,7 +1232,7 @@ async def get_journal_entries(
         # Create journal entries table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS JournalEntries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 title TEXT,
                 content TEXT NOT NULL,
@@ -1260,22 +1262,22 @@ async def get_journal_entries(
         """)
         
         # Build query with filters
-        where_clause = "WHERE userId = ?"
+        where_clause = "WHERE userId = %s"
         params = [user_id]
         
         if entry_type:
-            where_clause += " AND entry_type = ?"
+            where_clause += " AND entry_type = %s"
             params.append(entry_type)
         
         if asset_symbol:
-            where_clause += " AND asset_symbol = ?"
+            where_clause += " AND asset_symbol = %s"
             params.append(asset_symbol.upper())
         
         cursor.execute(f"""
             SELECT * FROM JournalEntries 
             {where_clause}
             ORDER BY entry_date DESC, created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, params + [limit])
         
         results = cursor.fetchall()
@@ -1327,7 +1329,7 @@ async def get_journal_entries(
                     (userId, title, content, entry_type, asset_symbol, trade_type,
                      entry_price, quantity, strategy_used, reasoning, confidence_level,
                      expected_outcome, lessons_learned, tags, mood, market_phase)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, entry["title"], entry["content"], entry["entry_type"],
                     entry.get("asset_symbol"), entry.get("trade_type"), entry.get("entry_price"),
@@ -1344,7 +1346,7 @@ async def get_journal_entries(
                 SELECT * FROM JournalEntries 
                 {where_clause}
                 ORDER BY entry_date DESC, created_at DESC
-                LIMIT ?
+                LIMIT %s
             """, params + [limit])
             
             results = cursor.fetchall()
@@ -1418,7 +1420,7 @@ async def create_journal_entry(
              entry_price, exit_price, quantity, strategy_used, reasoning,
              market_conditions, confidence_level, expected_outcome, actual_outcome,
              success_rating, lessons_learned, tags, mood, market_phase, is_public)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             entry.get("title"),
@@ -1479,13 +1481,13 @@ async def update_journal_entry(
         # Update the journal entry
         cursor.execute("""
             UPDATE JournalEntries 
-            SET title = ?, content = ?, entry_type = ?, asset_symbol = ?,
-                trade_type = ?, entry_price = ?, exit_price = ?, quantity = ?,
-                strategy_used = ?, reasoning = ?, market_conditions = ?,
-                confidence_level = ?, expected_outcome = ?, actual_outcome = ?,
-                success_rating = ?, lessons_learned = ?, tags = ?, mood = ?,
-                market_phase = ?, is_public = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            SET title = %s, content = %s, entry_type = %s, asset_symbol = %s,
+                trade_type = %s, entry_price = %s, exit_price = %s, quantity = %s,
+                strategy_used = %s, reasoning = %s, market_conditions = %s,
+                confidence_level = %s, expected_outcome = %s, actual_outcome = %s,
+                success_rating = %s, lessons_learned = %s, tags = %s, mood = %s,
+                market_phase = %s, is_public = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND userId = %s
         """, (
             entry.get("title"),
             entry["content"],
@@ -1547,7 +1549,7 @@ async def get_trade_logs(
         # Create manual trade logs table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ManualTradeLogs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 journal_entry_id INTEGER,
                 symbol TEXT NOT NULL,
@@ -1590,22 +1592,22 @@ async def get_trade_logs(
         """)
         
         # Build query with filters
-        where_clause = "WHERE userId = ?"
+        where_clause = "WHERE userId = %s"
         params = [user_id]
         
         if status:
-            where_clause += " AND status = ?"
+            where_clause += " AND status = %s"
             params.append(status)
         
         if symbol:
-            where_clause += " AND symbol = ?"
+            where_clause += " AND symbol = %s"
             params.append(symbol.upper())
         
         cursor.execute(f"""
             SELECT * FROM ManualTradeLogs 
             {where_clause}
             ORDER BY trade_date DESC, execution_time DESC
-            LIMIT ?
+            LIMIT %s
         """, params + [limit])
         
         results = cursor.fetchall()
@@ -1641,7 +1643,7 @@ async def get_trade_logs(
                      target_price, stop_loss_price, strategy, conviction_level, market_conditions,
                      technical_indicators, current_price, unrealized_pnl, unrealized_pnl_percent,
                      exit_price, exit_date, exit_reason, realized_pnl, realized_pnl_percent, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, trade["symbol"], trade["asset_name"], trade["trade_type"],
                     trade["entry_price"], trade["quantity"], trade["total_value"],
@@ -1659,7 +1661,7 @@ async def get_trade_logs(
                 SELECT * FROM ManualTradeLogs 
                 {where_clause}
                 ORDER BY trade_date DESC, execution_time DESC
-                LIMIT ?
+                LIMIT %s
             """, params + [limit])
             
             results = cursor.fetchall()
@@ -1747,7 +1749,7 @@ async def create_trade_log(
             (userId, symbol, asset_name, trade_type, entry_price, quantity, total_value,
              order_type, fees, broker, account_type, target_price, stop_loss_price,
              strategy, time_horizon, conviction_level, market_conditions)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             trade["symbol"].upper(),
@@ -1804,7 +1806,7 @@ async def close_trade_log(
         # Get the trade to calculate P&L
         cursor.execute("""
             SELECT * FROM ManualTradeLogs 
-            WHERE id = ? AND userId = ? AND status = 'open'
+            WHERE id = %s AND userId = %s AND status = 'open'
         """, (trade_id, user_id))
         
         trade = cursor.fetchone()
@@ -1828,10 +1830,10 @@ async def close_trade_log(
         # Update the trade
         cursor.execute("""
             UPDATE ManualTradeLogs 
-            SET exit_price = ?, exit_date = CURRENT_DATE, exit_reason = ?,
-                realized_pnl = ?, realized_pnl_percent = ?, status = 'closed',
+            SET exit_price = %s, exit_date = CURRENT_DATE, exit_reason = %s,
+                realized_pnl = %s, realized_pnl_percent = %s, status = 'closed',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (
             exit_price, exit_reason, realized_pnl, realized_pnl_percent, trade_id, user_id
         ))
@@ -1889,7 +1891,7 @@ async def get_journal_statistics(
                 COUNT(CASE WHEN entry_type = 'trade' THEN 1 END) as trade_entries,
                 COUNT(CASE WHEN entry_type = 'analysis' THEN 1 END) as analysis_entries
             FROM JournalEntries
-            WHERE userId = ? AND entry_date BETWEEN ? AND ?
+            WHERE userId = %s AND entry_date BETWEEN %s AND %s
         """, (user_id, start_date, end_date))
         
         journal_stats = cursor.fetchone()
@@ -1906,7 +1908,7 @@ async def get_journal_statistics(
                 COALESCE(MAX(realized_pnl), 0) as largest_win,
                 COALESCE(MIN(realized_pnl), 0) as largest_loss
             FROM ManualTradeLogs
-            WHERE userId = ? AND trade_date BETWEEN ? AND ? AND status = 'closed'
+            WHERE userId = %s AND trade_date BETWEEN %s AND %s AND status = 'closed'
         """, (user_id, start_date, end_date))
         
         trade_stats = cursor.fetchone()
@@ -1965,19 +1967,19 @@ async def export_journal_data(
         cursor = conn.cursor()
         
         # Build query
-        where_clause = "WHERE userId = ?"
+        where_clause = "WHERE userId = %s"
         params = [user_id]
         
         if entry_type:
-            where_clause += " AND entry_type = ?"
+            where_clause += " AND entry_type = %s"
             params.append(entry_type)
         
         if start_date:
-            where_clause += " AND entry_date >= ?"
+            where_clause += " AND entry_date >= %s"
             params.append(start_date)
         
         if end_date:
-            where_clause += " AND entry_date <= ?"
+            where_clause += " AND entry_date <= %s"
             params.append(end_date)
         
         cursor.execute(f"""
@@ -2046,4 +2048,4 @@ async def export_journal_data(
             }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))                

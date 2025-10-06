@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 from decimal import Decimal
 
 router = APIRouter()
@@ -76,8 +77,8 @@ class RotationRecommendation(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -88,7 +89,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_48",
@@ -117,7 +118,7 @@ async def get_rotation_preferences(user_id: int):
         # Create rotation preferences table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserRotationPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 rotation_aggression_level INTEGER NOT NULL DEFAULT 5,
                 rotation_frequency TEXT NOT NULL DEFAULT 'monthly',
@@ -126,27 +127,27 @@ async def get_rotation_preferences(user_id: int):
                 risk_tolerance TEXT NOT NULL DEFAULT 'moderate',
                 volatility_tolerance REAL NOT NULL DEFAULT 15.0,
                 drawdown_tolerance REAL NOT NULL DEFAULT 10.0,
-                auto_rebalance_enabled BOOLEAN NOT NULL DEFAULT 1,
+                auto_rebalance_enabled BOOLEAN NOT NULL DEFAULT true,
                 rebalance_trigger_threshold REAL NOT NULL DEFAULT 5.0,
                 max_single_trade_size REAL NOT NULL DEFAULT 10.0,
                 cash_buffer_percentage REAL NOT NULL DEFAULT 2.0,
-                strategy_rotation_enabled BOOLEAN NOT NULL DEFAULT 1,
+                strategy_rotation_enabled BOOLEAN NOT NULL DEFAULT true,
                 max_active_strategies INTEGER NOT NULL DEFAULT 3,
-                tax_loss_harvesting_enabled BOOLEAN NOT NULL DEFAULT 1,
+                tax_loss_harvesting_enabled BOOLEAN NOT NULL DEFAULT true,
                 tax_optimization_priority INTEGER NOT NULL DEFAULT 5,
-                nz_tax_optimization BOOLEAN NOT NULL DEFAULT 1,
-                franking_credits_consideration BOOLEAN NOT NULL DEFAULT 1,
+                nz_tax_optimization BOOLEAN NOT NULL DEFAULT true,
+                franking_credits_consideration BOOLEAN NOT NULL DEFAULT true,
                 currency_hedging_preference TEXT NOT NULL DEFAULT 'auto',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                last_applied_at TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                last_applied_at TIMESTAMPTZ,
                 UNIQUE(userId)
             )
         """)
         
         # Get user preferences
         cursor.execute("""
-            SELECT * FROM UserRotationPreferences WHERE userId = ?
+            SELECT * FROM UserRotationPreferences WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -162,7 +163,7 @@ async def get_rotation_preferences(user_id: int):
                  cash_buffer_percentage, strategy_rotation_enabled, max_active_strategies,
                  tax_loss_harvesting_enabled, tax_optimization_priority, nz_tax_optimization,
                  franking_credits_consideration, currency_hedging_preference)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 default_preferences.rotation_aggression_level,
@@ -189,7 +190,7 @@ async def get_rotation_preferences(user_id: int):
             
             # Fetch the created preferences
             cursor.execute("""
-                SELECT * FROM UserRotationPreferences WHERE userId = ?
+                SELECT * FROM UserRotationPreferences WHERE userId = %s
             """, (user_id,))
             result = cursor.fetchone()
         
@@ -254,16 +255,16 @@ async def update_rotation_preferences(user_id: int, preferences: RotationPrefere
         # Update preferences
         cursor.execute("""
             UPDATE UserRotationPreferences 
-            SET rotation_aggression_level = ?, rotation_frequency = ?, 
-                max_rotation_percentage = ?, min_rotation_threshold = ?,
-                risk_tolerance = ?, volatility_tolerance = ?, drawdown_tolerance = ?,
-                auto_rebalance_enabled = ?, rebalance_trigger_threshold = ?,
-                max_single_trade_size = ?, cash_buffer_percentage = ?,
-                strategy_rotation_enabled = ?, max_active_strategies = ?,
-                tax_loss_harvesting_enabled = ?, tax_optimization_priority = ?,
-                nz_tax_optimization = ?, franking_credits_consideration = ?,
-                currency_hedging_preference = ?, updated_at = ?, last_applied_at = ?
-            WHERE userId = ?
+            SET rotation_aggression_level = %s, rotation_frequency = %s, 
+                max_rotation_percentage = %s, min_rotation_threshold = %s,
+                risk_tolerance = %s, volatility_tolerance = %s, drawdown_tolerance = %s,
+                auto_rebalance_enabled = %s, rebalance_trigger_threshold = %s,
+                max_single_trade_size = %s, cash_buffer_percentage = %s,
+                strategy_rotation_enabled = %s, max_active_strategies = %s,
+                tax_loss_harvesting_enabled = %s, tax_optimization_priority = %s,
+                nz_tax_optimization = %s, franking_credits_consideration = %s,
+                currency_hedging_preference = %s, updated_at = %s, last_applied_at = %s
+            WHERE userId = %s
         """, (
             preferences.rotation_aggression_level,
             preferences.rotation_frequency,
@@ -298,7 +299,7 @@ async def update_rotation_preferences(user_id: int, preferences: RotationPrefere
                  cash_buffer_percentage, strategy_rotation_enabled, max_active_strategies,
                  tax_loss_harvesting_enabled, tax_optimization_priority, nz_tax_optimization,
                  franking_credits_consideration, currency_hedging_preference)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 preferences.rotation_aggression_level,
@@ -355,7 +356,7 @@ async def get_rotation_recommendation(user_id: int, portfolio_data: Dict[str, An
         
         # Get user preferences
         cursor.execute("""
-            SELECT * FROM UserRotationPreferences WHERE userId = ?
+            SELECT * FROM UserRotationPreferences WHERE userId = %s
         """, (user_id,))
         
         prefs = cursor.fetchone()
@@ -454,9 +455,9 @@ async def execute_rotation(user_id: int, rotation_event: RotationEvent):
         # Create rotation history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS RotationHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
-                rotation_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                rotation_date TIMESTAMPTZ DEFAULT NOW(),
                 rotation_type TEXT NOT NULL,
                 aggression_level INTEGER NOT NULL,
                 assets_rotated INTEGER NOT NULL DEFAULT 0,
@@ -469,7 +470,7 @@ async def execute_rotation(user_id: int, rotation_event: RotationEvent):
                 market_trend TEXT,
                 rotation_trigger TEXT,
                 rotation_data TEXT DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         
@@ -479,7 +480,7 @@ async def execute_rotation(user_id: int, rotation_event: RotationEvent):
             (userId, rotation_type, aggression_level, assets_rotated, total_rotation_amount,
              expected_return_improvement, risk_reduction_achieved, transaction_costs,
              tax_impact, market_volatility, market_trend, rotation_trigger, rotation_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             rotation_event.rotation_type,
@@ -537,14 +538,14 @@ async def get_rotation_history(
         cursor = conn.cursor()
         
         # Build query with optional filters
-        query = "SELECT * FROM RotationHistory WHERE userId = ?"
+        query = "SELECT * FROM RotationHistory WHERE userId = %s"
         params = [user_id]
         
         if rotation_type:
-            query += " AND rotation_type = ?"
+            query += " AND rotation_type = %s"
             params.append(rotation_type)
         
-        query += " ORDER BY rotation_date DESC LIMIT ?"
+        query += " ORDER BY rotation_date DESC LIMIT %s"
         params.append(limit)
         
         cursor.execute(query, params)
@@ -598,7 +599,7 @@ async def get_rotation_performance(user_id: int, period: str = Query("30d")):
                 MIN(rotation_date) as first_rotation,
                 MAX(rotation_date) as last_rotation
             FROM RotationHistory 
-            WHERE userId = ? AND rotation_date >= ?
+            WHERE userId = %s AND rotation_date >= %s
         """, (user_id, start_date))
         
         result = cursor.fetchone()
@@ -610,7 +611,7 @@ async def get_rotation_performance(user_id: int, period: str = Query("30d")):
             SELECT 
                 COUNT(*) as successful_rotations
             FROM RotationHistory 
-            WHERE userId = ? AND rotation_date >= ? AND expected_return_improvement > 0
+            WHERE userId = %s AND rotation_date >= %s AND expected_return_improvement > 0
         """, (user_id, start_date))
         
         successful = cursor.fetchone()[0] or 0
@@ -635,8 +636,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 from decimal import Decimal
 
 router = APIRouter()
@@ -708,8 +710,8 @@ class RotationRecommendation(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -720,7 +722,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_48",
@@ -749,7 +751,7 @@ async def get_rotation_preferences(user_id: int):
         # Create rotation preferences table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserRotationPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 rotation_aggression_level INTEGER NOT NULL DEFAULT 5,
                 rotation_frequency TEXT NOT NULL DEFAULT 'monthly',
@@ -758,27 +760,27 @@ async def get_rotation_preferences(user_id: int):
                 risk_tolerance TEXT NOT NULL DEFAULT 'moderate',
                 volatility_tolerance REAL NOT NULL DEFAULT 15.0,
                 drawdown_tolerance REAL NOT NULL DEFAULT 10.0,
-                auto_rebalance_enabled BOOLEAN NOT NULL DEFAULT 1,
+                auto_rebalance_enabled BOOLEAN NOT NULL DEFAULT true,
                 rebalance_trigger_threshold REAL NOT NULL DEFAULT 5.0,
                 max_single_trade_size REAL NOT NULL DEFAULT 10.0,
                 cash_buffer_percentage REAL NOT NULL DEFAULT 2.0,
-                strategy_rotation_enabled BOOLEAN NOT NULL DEFAULT 1,
+                strategy_rotation_enabled BOOLEAN NOT NULL DEFAULT true,
                 max_active_strategies INTEGER NOT NULL DEFAULT 3,
-                tax_loss_harvesting_enabled BOOLEAN NOT NULL DEFAULT 1,
+                tax_loss_harvesting_enabled BOOLEAN NOT NULL DEFAULT true,
                 tax_optimization_priority INTEGER NOT NULL DEFAULT 5,
-                nz_tax_optimization BOOLEAN NOT NULL DEFAULT 1,
-                franking_credits_consideration BOOLEAN NOT NULL DEFAULT 1,
+                nz_tax_optimization BOOLEAN NOT NULL DEFAULT true,
+                franking_credits_consideration BOOLEAN NOT NULL DEFAULT true,
                 currency_hedging_preference TEXT NOT NULL DEFAULT 'auto',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                last_applied_at TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                last_applied_at TIMESTAMPTZ,
                 UNIQUE(userId)
             )
         """)
         
         # Get user preferences
         cursor.execute("""
-            SELECT * FROM UserRotationPreferences WHERE userId = ?
+            SELECT * FROM UserRotationPreferences WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -794,7 +796,7 @@ async def get_rotation_preferences(user_id: int):
                  cash_buffer_percentage, strategy_rotation_enabled, max_active_strategies,
                  tax_loss_harvesting_enabled, tax_optimization_priority, nz_tax_optimization,
                  franking_credits_consideration, currency_hedging_preference)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 default_preferences.rotation_aggression_level,
@@ -821,7 +823,7 @@ async def get_rotation_preferences(user_id: int):
             
             # Fetch the created preferences
             cursor.execute("""
-                SELECT * FROM UserRotationPreferences WHERE userId = ?
+                SELECT * FROM UserRotationPreferences WHERE userId = %s
             """, (user_id,))
             result = cursor.fetchone()
         
@@ -886,16 +888,16 @@ async def update_rotation_preferences(user_id: int, preferences: RotationPrefere
         # Update preferences
         cursor.execute("""
             UPDATE UserRotationPreferences 
-            SET rotation_aggression_level = ?, rotation_frequency = ?, 
-                max_rotation_percentage = ?, min_rotation_threshold = ?,
-                risk_tolerance = ?, volatility_tolerance = ?, drawdown_tolerance = ?,
-                auto_rebalance_enabled = ?, rebalance_trigger_threshold = ?,
-                max_single_trade_size = ?, cash_buffer_percentage = ?,
-                strategy_rotation_enabled = ?, max_active_strategies = ?,
-                tax_loss_harvesting_enabled = ?, tax_optimization_priority = ?,
-                nz_tax_optimization = ?, franking_credits_consideration = ?,
-                currency_hedging_preference = ?, updated_at = ?, last_applied_at = ?
-            WHERE userId = ?
+            SET rotation_aggression_level = %s, rotation_frequency = %s, 
+                max_rotation_percentage = %s, min_rotation_threshold = %s,
+                risk_tolerance = %s, volatility_tolerance = %s, drawdown_tolerance = %s,
+                auto_rebalance_enabled = %s, rebalance_trigger_threshold = %s,
+                max_single_trade_size = %s, cash_buffer_percentage = %s,
+                strategy_rotation_enabled = %s, max_active_strategies = %s,
+                tax_loss_harvesting_enabled = %s, tax_optimization_priority = %s,
+                nz_tax_optimization = %s, franking_credits_consideration = %s,
+                currency_hedging_preference = %s, updated_at = %s, last_applied_at = %s
+            WHERE userId = %s
         """, (
             preferences.rotation_aggression_level,
             preferences.rotation_frequency,
@@ -930,7 +932,7 @@ async def update_rotation_preferences(user_id: int, preferences: RotationPrefere
                  cash_buffer_percentage, strategy_rotation_enabled, max_active_strategies,
                  tax_loss_harvesting_enabled, tax_optimization_priority, nz_tax_optimization,
                  franking_credits_consideration, currency_hedging_preference)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 preferences.rotation_aggression_level,
@@ -987,7 +989,7 @@ async def get_rotation_recommendation(user_id: int, portfolio_data: Dict[str, An
         
         # Get user preferences
         cursor.execute("""
-            SELECT * FROM UserRotationPreferences WHERE userId = ?
+            SELECT * FROM UserRotationPreferences WHERE userId = %s
         """, (user_id,))
         
         prefs = cursor.fetchone()
@@ -1086,9 +1088,9 @@ async def execute_rotation(user_id: int, rotation_event: RotationEvent):
         # Create rotation history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS RotationHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
-                rotation_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                rotation_date TIMESTAMPTZ DEFAULT NOW(),
                 rotation_type TEXT NOT NULL,
                 aggression_level INTEGER NOT NULL,
                 assets_rotated INTEGER NOT NULL DEFAULT 0,
@@ -1101,7 +1103,7 @@ async def execute_rotation(user_id: int, rotation_event: RotationEvent):
                 market_trend TEXT,
                 rotation_trigger TEXT,
                 rotation_data TEXT DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         
@@ -1111,7 +1113,7 @@ async def execute_rotation(user_id: int, rotation_event: RotationEvent):
             (userId, rotation_type, aggression_level, assets_rotated, total_rotation_amount,
              expected_return_improvement, risk_reduction_achieved, transaction_costs,
              tax_impact, market_volatility, market_trend, rotation_trigger, rotation_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             rotation_event.rotation_type,
@@ -1169,14 +1171,14 @@ async def get_rotation_history(
         cursor = conn.cursor()
         
         # Build query with optional filters
-        query = "SELECT * FROM RotationHistory WHERE userId = ?"
+        query = "SELECT * FROM RotationHistory WHERE userId = %s"
         params = [user_id]
         
         if rotation_type:
-            query += " AND rotation_type = ?"
+            query += " AND rotation_type = %s"
             params.append(rotation_type)
         
-        query += " ORDER BY rotation_date DESC LIMIT ?"
+        query += " ORDER BY rotation_date DESC LIMIT %s"
         params.append(limit)
         
         cursor.execute(query, params)
@@ -1230,7 +1232,7 @@ async def get_rotation_performance(user_id: int, period: str = Query("30d")):
                 MIN(rotation_date) as first_rotation,
                 MAX(rotation_date) as last_rotation
             FROM RotationHistory 
-            WHERE userId = ? AND rotation_date >= ?
+            WHERE userId = %s AND rotation_date >= %s
         """, (user_id, start_date))
         
         result = cursor.fetchone()
@@ -1242,7 +1244,7 @@ async def get_rotation_performance(user_id: int, period: str = Query("30d")):
             SELECT 
                 COUNT(*) as successful_rotations
             FROM RotationHistory 
-            WHERE userId = ? AND rotation_date >= ? AND expected_return_improvement > 0
+            WHERE userId = %s AND rotation_date >= %s AND expected_return_improvement > 0
         """, (user_id, start_date))
         
         successful = cursor.fetchone()[0] or 0
@@ -1262,4 +1264,4 @@ async def get_rotation_performance(user_id: int, period: str = Query("30d")):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))          

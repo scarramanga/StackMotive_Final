@@ -3,8 +3,9 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 import random
 
 router = APIRouter()
@@ -32,8 +33,8 @@ class MacroAlert(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -44,7 +45,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_8",
@@ -108,7 +109,7 @@ async def get_macro_insights(user_id: int, limit: int = 10):
         # Create MacroSignal table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS MacroSignal (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 indicator TEXT NOT NULL,
                 value REAL NOT NULL,
                 previousValue REAL,
@@ -147,15 +148,15 @@ async def get_macro_insights(user_id: int, limit: int = 10):
                     INSERT INTO MacroSignal 
                     (indicator, value, previousValue, change, changePercentage, 
                      timestamp, source, aiInsight, impactScore)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (indicator, value, prev_val, change, change_pct, 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (indicator, value, prev_val, change, change_pct,
                       timestamp.isoformat(), source, ai_insight, impact))
         
         # Get latest signals
         cursor.execute("""
             SELECT * FROM MacroSignal 
             ORDER BY timestamp DESC 
-            LIMIT ?
+            LIMIT %s
         """, (limit,))
         
         columns = [description[0] for description in cursor.description]
@@ -226,7 +227,7 @@ async def create_macro_alert(alert: MacroAlert):
         # Create MacroAlert table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS MacroAlert (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 indicator TEXT NOT NULL,
                 threshold REAL NOT NULL,
@@ -242,8 +243,8 @@ async def create_macro_alert(alert: MacroAlert):
         cursor.execute("""
             INSERT INTO MacroAlert 
             (userId, indicator, threshold, condition, enabled)
-            VALUES (?, ?, ?, ?, ?)
-        """, (alert.userId, alert.indicator, alert.threshold, 
+            VALUES (%s, %s, %s, %s, %s)
+        """, (alert.userId, alert.indicator, alert.threshold,
               alert.condition, alert.enabled))
         
         alert_id = cursor.lastrowid
@@ -283,7 +284,7 @@ async def get_macro_alerts(user_id: int):
         
         cursor.execute("""
             SELECT * FROM MacroAlert 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY createdAt DESC
         """, (user_id,))
         
@@ -311,7 +312,7 @@ async def refresh_macro_data():
             # Get latest value
             cursor.execute("""
                 SELECT value FROM MacroSignal 
-                WHERE indicator = ? 
+                WHERE indicator = %s 
                 ORDER BY timestamp DESC 
                 LIMIT 1
             """, (indicator,))
@@ -336,7 +337,7 @@ async def refresh_macro_data():
                 INSERT INTO MacroSignal 
                 (indicator, value, previousValue, change, changePercentage, 
                  timestamp, source, aiInsight, impactScore)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (indicator, new_value, current_value, change, change_percentage,
                   datetime.now().isoformat(), "simulated", ai_insight, impact_score))
         
@@ -372,7 +373,7 @@ async def get_macro_dashboard(user_id: int):
                 SELECT value, previousValue, change, changePercentage, 
                        timestamp, aiInsight, impactScore
                 FROM MacroSignal 
-                WHERE indicator = ?
+                WHERE indicator = %s
                 ORDER BY timestamp DESC 
                 LIMIT 1
             """, (indicator,))
@@ -395,7 +396,7 @@ async def get_macro_dashboard(user_id: int):
                    SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) as active,
                    SUM(CASE WHEN triggered = 1 THEN 1 ELSE 0 END) as triggered
             FROM MacroAlert 
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         alert_stats = cursor.fetchone()
@@ -426,4 +427,4 @@ async def get_macro_dashboard(user_id: int):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            

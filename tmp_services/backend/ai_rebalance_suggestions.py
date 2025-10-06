@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -49,8 +50,8 @@ class SuggestionResponse(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -60,7 +61,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AgentMemory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 actionType TEXT NOT NULL,
                 actionSummary TEXT NOT NULL,
@@ -75,7 +76,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, actionType, actionSummary, inputData, outputData, metadata, timestamp, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             action_type,
@@ -141,7 +142,7 @@ async def generate_ai_suggestions(user_id: int) -> AIRebalanceSession:
         # Get portfolio positions
         cursor.execute("""
             SELECT * FROM PortfolioPosition 
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         positions = cursor.fetchall()
@@ -339,7 +340,7 @@ async def respond_to_suggestion(user_id: int, response: SuggestionResponse):
         # Create AI suggestion responses table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AISuggestionResponse (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 suggestionId TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -354,7 +355,7 @@ async def respond_to_suggestion(user_id: int, response: SuggestionResponse):
         cursor.execute("""
             INSERT INTO AISuggestionResponse 
             (userId, suggestionId, action, userNotes, modifiedAmount, responseTimestamp, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             response.suggestionId,
@@ -409,7 +410,7 @@ async def get_suggestion_history(user_id: int):
         
         cursor.execute("""
             SELECT * FROM AISuggestionResponse 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY responseTimestamp DESC 
             LIMIT 50
         """, (user_id,))
@@ -446,4 +447,4 @@ async def refresh_ai_suggestions(user_id: int):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))          

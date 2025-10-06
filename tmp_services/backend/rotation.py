@@ -2,8 +2,9 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 import uuid
 import random
 from pydantic import BaseModel, Field
@@ -71,8 +72,8 @@ class RotationOverlayResponse(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Database operations
 def create_rotation_overlay_tables():
@@ -103,8 +104,8 @@ def create_rotation_overlay_tables():
             last_rotation TEXT,
             next_rotation TEXT,
             cooldown_ends TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     
@@ -410,4 +411,4 @@ async def get_rotation_history(
         return history
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch rotation history: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Failed to fetch rotation history: {str(e)}")      

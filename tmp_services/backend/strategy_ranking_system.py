@@ -5,8 +5,9 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -21,8 +22,8 @@ class StrategyRanking(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 @router.get("/strategy-ranking-system/rankings")
 async def get_strategy_rankings(user_id: int = 1):
@@ -33,7 +34,7 @@ async def get_strategy_rankings(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyRankings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 strategy_id TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
@@ -52,7 +53,7 @@ async def get_strategy_rankings(user_id: int = 1):
         """)
         
         # Check if we have rankings
-        cursor.execute("SELECT COUNT(*) FROM StrategyRankings WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT COUNT(*) FROM StrategyRankings WHERE userId = %s", (user_id,))
         count = cursor.fetchone()[0]
         
         if count == 0:
@@ -68,7 +69,7 @@ async def get_strategy_rankings(user_id: int = 1):
                     INSERT INTO StrategyRankings 
                     (userId, strategy_id, strategy_name, rank_position, overall_score, performance_score, 
                      risk_score, consistency_score, sharpe_ratio, total_return)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, ranking["strategy_id"], ranking["strategy_name"], ranking["rank_position"],
                     ranking["overall_score"], ranking["performance_score"], ranking["risk_score"],
@@ -80,7 +81,7 @@ async def get_strategy_rankings(user_id: int = 1):
         # Get rankings
         cursor.execute("""
             SELECT * FROM StrategyRankings 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY rank_position
         """, (user_id,))
         
@@ -112,7 +113,7 @@ async def get_strategy_leaderboard(user_id: int = 1):
                 total_return,
                 rank_position
             FROM StrategyRankings 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY rank_position
             LIMIT 10
         """, (user_id,))
@@ -133,8 +134,9 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -149,8 +151,8 @@ class StrategyRanking(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 @router.get("/strategy-ranking-system/rankings")
 async def get_strategy_rankings(user_id: int = 1):
@@ -161,7 +163,7 @@ async def get_strategy_rankings(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyRankings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 strategy_id TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
@@ -180,7 +182,7 @@ async def get_strategy_rankings(user_id: int = 1):
         """)
         
         # Check if we have rankings
-        cursor.execute("SELECT COUNT(*) FROM StrategyRankings WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT COUNT(*) FROM StrategyRankings WHERE userId = %s", (user_id,))
         count = cursor.fetchone()[0]
         
         if count == 0:
@@ -196,7 +198,7 @@ async def get_strategy_rankings(user_id: int = 1):
                     INSERT INTO StrategyRankings 
                     (userId, strategy_id, strategy_name, rank_position, overall_score, performance_score, 
                      risk_score, consistency_score, sharpe_ratio, total_return)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, ranking["strategy_id"], ranking["strategy_name"], ranking["rank_position"],
                     ranking["overall_score"], ranking["performance_score"], ranking["risk_score"],
@@ -208,7 +210,7 @@ async def get_strategy_rankings(user_id: int = 1):
         # Get rankings
         cursor.execute("""
             SELECT * FROM StrategyRankings 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY rank_position
         """, (user_id,))
         
@@ -240,7 +242,7 @@ async def get_strategy_leaderboard(user_id: int = 1):
                 total_return,
                 rank_position
             FROM StrategyRankings 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY rank_position
             LIMIT 10
         """, (user_id,))
@@ -254,4 +256,4 @@ async def get_strategy_leaderboard(user_id: int = 1):
         return {"leaderboard": leaderboard}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))          

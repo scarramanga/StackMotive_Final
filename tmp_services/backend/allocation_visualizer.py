@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -51,8 +52,8 @@ class AllocationTarget(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Log to Agent Memory Table
 async def log_to_agent_memory(
@@ -69,7 +70,7 @@ async def log_to_agent_memory(
         
         cursor.execute("""
             INSERT INTO AgentMemory (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "3",  # Block 3 - Allocation Visualizer
@@ -154,7 +155,7 @@ async def calculate_allocation_analysis(user_id: int) -> AllocationAnalysis:
                 sa.metadata as strategy_metadata
             FROM PortfolioPosition pp
             LEFT JOIN StrategyAssignment sa ON pp.id = sa.positionId
-            WHERE pp.userId = ?
+            WHERE pp.userId = %s
         """, (user_id,))
         
         positions = cursor.fetchall()
@@ -524,4 +525,4 @@ async def refresh_allocation_data(user_id: int):
             {"error": str(e)}
         )
         
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))        

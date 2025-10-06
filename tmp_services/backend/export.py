@@ -5,8 +5,9 @@ import uuid
 import hashlib
 import json
 from pydantic import BaseModel, Field
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -42,8 +43,8 @@ class SnapshotExportHistoryResponse(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Database operations
 def create_snapshot_export_history_table():
@@ -63,8 +64,8 @@ def create_snapshot_export_history_table():
             status TEXT NOT NULL DEFAULT 'completed',
             file_size INTEGER,
             download_count INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     
@@ -113,7 +114,7 @@ async def create_snapshot_export(
         cursor.execute("""
             INSERT INTO snapshot_export_history 
             (id, user_id, export_type, metadata, content_hash, export_method, exported_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             export_id,
             export_request.userId,
@@ -170,9 +171,9 @@ async def get_export_history_for_user(
             SELECT id, user_id, export_type, metadata, content_hash, export_method, 
                    exported_at, status, file_size, download_count
             FROM snapshot_export_history 
-            WHERE user_id = ? 
+            WHERE user_id = %s 
             ORDER BY exported_at DESC 
-            LIMIT ?
+            LIMIT %s
         """, (user_id, limit))
         
         rows = cursor.fetchall()
@@ -227,7 +228,7 @@ async def get_export_stats(
                 MAX(exported_at) as last_export,
                 AVG(file_size) as avg_file_size
             FROM snapshot_export_history 
-            WHERE user_id = ?
+            WHERE user_id = %s
         """, (user_id,))
         
         row = cursor.fetchone()
@@ -256,4 +257,4 @@ async def get_export_stats(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to retrieve export stats: {str(e)}"
-        ) 
+        )              

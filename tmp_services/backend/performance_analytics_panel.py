@@ -15,8 +15,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, date, timedelta
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 import math
 
 router = APIRouter()
@@ -88,8 +89,8 @@ class PerformanceSummary(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -100,7 +101,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_17",
@@ -133,7 +134,7 @@ async def get_portfolio_performance(
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS PortfolioPerformanceHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 date TEXT NOT NULL,
                 total_value REAL NOT NULL,
@@ -170,7 +171,7 @@ async def get_portfolio_performance(
         # Get portfolio performance data
         cursor.execute("""
             SELECT * FROM PortfolioPerformanceHistory 
-            WHERE userId = ? AND date >= ? AND date <= ?
+            WHERE userId = %s AND date >= %s AND date <= %s
             ORDER BY date ASC
         """, (user_id, start_date.isoformat(), end_date.isoformat()))
         
@@ -187,7 +188,7 @@ async def get_portfolio_performance(
                     INSERT OR REPLACE INTO PortfolioPerformanceHistory 
                     (userId, date, total_value, equity_value, crypto_value, cash_value,
                      daily_change, daily_change_pct, total_return)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     data_point['date'],
@@ -205,7 +206,7 @@ async def get_portfolio_performance(
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM PortfolioPerformanceHistory 
-                WHERE userId = ? AND date >= ? AND date <= ?
+                WHERE userId = %s AND date >= %s AND date <= %s
                 ORDER BY date ASC
             """, (user_id, start_date.isoformat(), end_date.isoformat()))
             
@@ -266,7 +267,7 @@ async def get_trading_metrics(
         # Create trading metrics table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TradingPerformanceMetrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 period_start TEXT NOT NULL,
                 period_end TEXT NOT NULL,
@@ -301,8 +302,8 @@ async def get_trading_metrics(
         # Get trading metrics
         cursor.execute("""
             SELECT * FROM TradingPerformanceMetrics 
-            WHERE userId = ? AND period_type = ? 
-            AND period_start >= ? AND period_end <= ?
+            WHERE userId = %s AND period_type = %s 
+            AND period_start >= %s AND period_end <= %s
             ORDER BY period_start DESC
         """, (user_id, period_type, start_date, end_date))
         
@@ -320,7 +321,7 @@ async def get_trading_metrics(
                     (userId, period_start, period_end, period_type, total_trades,
                      winning_trades, losing_trades, win_rate, total_pnl, realized_pnl,
                      average_win, average_loss, largest_win, largest_loss, profit_factor)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     metric['period_start'],
@@ -344,8 +345,8 @@ async def get_trading_metrics(
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM TradingPerformanceMetrics 
-                WHERE userId = ? AND period_type = ? 
-                AND period_start >= ? AND period_end <= ?
+                WHERE userId = %s AND period_type = %s 
+                AND period_start >= %s AND period_end <= %s
                 ORDER BY period_start DESC
             """, (user_id, period_type, start_date, end_date))
             
@@ -406,7 +407,7 @@ async def get_risk_analytics(user_id: int = 1):
         # Create risk analytics table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS RiskAnalytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 analysis_date TEXT NOT NULL,
                 portfolio_variance REAL DEFAULT 0,
@@ -428,7 +429,7 @@ async def get_risk_analytics(user_id: int = 1):
         # Get latest risk analytics
         cursor.execute("""
             SELECT * FROM RiskAnalytics 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY analysis_date DESC 
             LIMIT 1
         """, (user_id,))
@@ -444,7 +445,7 @@ async def get_risk_analytics(user_id: int = 1):
                 (userId, analysis_date, portfolio_volatility, portfolio_beta,
                  var_1day_95, var_1day_99, cvar_1day_95, largest_position_pct,
                  top_5_positions_pct, top_10_positions_pct, sector_concentrations)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 datetime.now().date().isoformat(),
@@ -464,7 +465,7 @@ async def get_risk_analytics(user_id: int = 1):
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM RiskAnalytics 
-                WHERE userId = ? 
+                WHERE userId = %s 
                 ORDER BY analysis_date DESC 
                 LIMIT 1
             """, (user_id,))
@@ -613,7 +614,7 @@ async def update_portfolio_performance(
         # Get previous value for change calculation
         cursor.execute("""
             SELECT total_value FROM PortfolioPerformanceHistory 
-            WHERE userId = ? AND date < ?
+            WHERE userId = %s AND date < %s
             ORDER BY date DESC LIMIT 1
         """, (user_id, update_date))
         
@@ -629,7 +630,7 @@ async def update_portfolio_performance(
             INSERT OR REPLACE INTO PortfolioPerformanceHistory 
             (userId, date, total_value, equity_value, crypto_value, cash_value,
              daily_change, daily_change_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id, update_date, total_value, equity_value, crypto_value, 
             cash_value, daily_change, daily_change_pct
@@ -804,8 +805,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, date, timedelta
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 import math
 
 router = APIRouter()
@@ -877,8 +879,8 @@ class PerformanceSummary(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -889,7 +891,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_17",
@@ -922,7 +924,7 @@ async def get_portfolio_performance(
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS PortfolioPerformanceHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 date TEXT NOT NULL,
                 total_value REAL NOT NULL,
@@ -959,7 +961,7 @@ async def get_portfolio_performance(
         # Get portfolio performance data
         cursor.execute("""
             SELECT * FROM PortfolioPerformanceHistory 
-            WHERE userId = ? AND date >= ? AND date <= ?
+            WHERE userId = %s AND date >= %s AND date <= %s
             ORDER BY date ASC
         """, (user_id, start_date.isoformat(), end_date.isoformat()))
         
@@ -976,7 +978,7 @@ async def get_portfolio_performance(
                     INSERT OR REPLACE INTO PortfolioPerformanceHistory 
                     (userId, date, total_value, equity_value, crypto_value, cash_value,
                      daily_change, daily_change_pct, total_return)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     data_point['date'],
@@ -994,7 +996,7 @@ async def get_portfolio_performance(
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM PortfolioPerformanceHistory 
-                WHERE userId = ? AND date >= ? AND date <= ?
+                WHERE userId = %s AND date >= %s AND date <= %s
                 ORDER BY date ASC
             """, (user_id, start_date.isoformat(), end_date.isoformat()))
             
@@ -1055,7 +1057,7 @@ async def get_trading_metrics(
         # Create trading metrics table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TradingPerformanceMetrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 period_start TEXT NOT NULL,
                 period_end TEXT NOT NULL,
@@ -1090,8 +1092,8 @@ async def get_trading_metrics(
         # Get trading metrics
         cursor.execute("""
             SELECT * FROM TradingPerformanceMetrics 
-            WHERE userId = ? AND period_type = ? 
-            AND period_start >= ? AND period_end <= ?
+            WHERE userId = %s AND period_type = %s 
+            AND period_start >= %s AND period_end <= %s
             ORDER BY period_start DESC
         """, (user_id, period_type, start_date, end_date))
         
@@ -1109,7 +1111,7 @@ async def get_trading_metrics(
                     (userId, period_start, period_end, period_type, total_trades,
                      winning_trades, losing_trades, win_rate, total_pnl, realized_pnl,
                      average_win, average_loss, largest_win, largest_loss, profit_factor)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     metric['period_start'],
@@ -1133,8 +1135,8 @@ async def get_trading_metrics(
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM TradingPerformanceMetrics 
-                WHERE userId = ? AND period_type = ? 
-                AND period_start >= ? AND period_end <= ?
+                WHERE userId = %s AND period_type = %s 
+                AND period_start >= %s AND period_end <= %s
                 ORDER BY period_start DESC
             """, (user_id, period_type, start_date, end_date))
             
@@ -1195,7 +1197,7 @@ async def get_risk_analytics(user_id: int = 1):
         # Create risk analytics table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS RiskAnalytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 analysis_date TEXT NOT NULL,
                 portfolio_variance REAL DEFAULT 0,
@@ -1217,7 +1219,7 @@ async def get_risk_analytics(user_id: int = 1):
         # Get latest risk analytics
         cursor.execute("""
             SELECT * FROM RiskAnalytics 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY analysis_date DESC 
             LIMIT 1
         """, (user_id,))
@@ -1233,7 +1235,7 @@ async def get_risk_analytics(user_id: int = 1):
                 (userId, analysis_date, portfolio_volatility, portfolio_beta,
                  var_1day_95, var_1day_99, cvar_1day_95, largest_position_pct,
                  top_5_positions_pct, top_10_positions_pct, sector_concentrations)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 datetime.now().date().isoformat(),
@@ -1253,7 +1255,7 @@ async def get_risk_analytics(user_id: int = 1):
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM RiskAnalytics 
-                WHERE userId = ? 
+                WHERE userId = %s 
                 ORDER BY analysis_date DESC 
                 LIMIT 1
             """, (user_id,))
@@ -1402,7 +1404,7 @@ async def update_portfolio_performance(
         # Get previous value for change calculation
         cursor.execute("""
             SELECT total_value FROM PortfolioPerformanceHistory 
-            WHERE userId = ? AND date < ?
+            WHERE userId = %s AND date < %s
             ORDER BY date DESC LIMIT 1
         """, (user_id, update_date))
         
@@ -1418,7 +1420,7 @@ async def update_portfolio_performance(
             INSERT OR REPLACE INTO PortfolioPerformanceHistory 
             (userId, date, total_value, equity_value, crypto_value, cash_value,
              daily_change, daily_change_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id, update_date, total_value, equity_value, crypto_value, 
             cash_value, daily_change, daily_change_pct
@@ -1576,4 +1578,4 @@ def get_concentration_risk_level(largest_position_pct: float) -> str:
     elif largest_position_pct < 30:
         return "High"
     else:
-        return "Very High" 
+        return "Very High"          

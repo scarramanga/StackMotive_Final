@@ -5,8 +5,9 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -24,8 +25,8 @@ class LiveSignal(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 @router.get("/live-signal-summary-panel/signals")
 async def get_live_signals(user_id: int = 1):
@@ -36,7 +37,7 @@ async def get_live_signals(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS LiveSignals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 signal_id TEXT NOT NULL,
                 signal_source TEXT NOT NULL,
@@ -57,7 +58,7 @@ async def get_live_signals(user_id: int = 1):
         # Get active signals
         cursor.execute("""
             SELECT * FROM LiveSignals 
-            WHERE userId = ? AND signal_status = 'active'
+            WHERE userId = %s AND signal_status = 'active'
             ORDER BY signal_timestamp DESC, priority_level
             LIMIT 50
         """, (user_id,))
@@ -77,7 +78,7 @@ async def get_live_signals(user_id: int = 1):
                     INSERT OR REPLACE INTO LiveSignals 
                     (userId, signal_id, signal_source, signal_type, asset_symbol, signal_title,
                      confidence_score, signal_strength, priority_level, current_price, signal_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, signal["signal_id"], signal["signal_source"], signal["signal_type"],
                     signal["asset_symbol"], signal["signal_title"], signal["confidence_score"],
@@ -90,7 +91,7 @@ async def get_live_signals(user_id: int = 1):
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM LiveSignals 
-                WHERE userId = ? AND signal_status = 'active'
+                WHERE userId = %s AND signal_status = 'active'
                 ORDER BY signal_timestamp DESC
                 LIMIT 50
             """, (user_id,))
@@ -117,7 +118,7 @@ async def add_live_signal(signal: LiveSignal = Body(...), user_id: int = 1):
             INSERT OR REPLACE INTO LiveSignals 
             (userId, signal_id, signal_source, signal_type, asset_symbol, signal_title,
              confidence_score, signal_strength, priority_level, current_price, signal_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id, signal.signalId, signal.signalSource, signal.signalType,
             signal.assetSymbol, signal.signalTitle, signal.confidenceScore,
@@ -148,7 +149,7 @@ async def get_signal_summary(user_id: int = 1):
                 COUNT(CASE WHEN priority_level = 'high' THEN 1 END) as high_priority,
                 AVG(confidence_score) as avg_confidence
             FROM LiveSignals 
-            WHERE userId = ? AND signal_status = 'active'
+            WHERE userId = %s AND signal_status = 'active'
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -170,8 +171,9 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -189,8 +191,8 @@ class LiveSignal(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 @router.get("/live-signal-summary-panel/signals")
 async def get_live_signals(user_id: int = 1):
@@ -201,7 +203,7 @@ async def get_live_signals(user_id: int = 1):
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS LiveSignals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 signal_id TEXT NOT NULL,
                 signal_source TEXT NOT NULL,
@@ -222,7 +224,7 @@ async def get_live_signals(user_id: int = 1):
         # Get active signals
         cursor.execute("""
             SELECT * FROM LiveSignals 
-            WHERE userId = ? AND signal_status = 'active'
+            WHERE userId = %s AND signal_status = 'active'
             ORDER BY signal_timestamp DESC, priority_level
             LIMIT 50
         """, (user_id,))
@@ -242,7 +244,7 @@ async def get_live_signals(user_id: int = 1):
                     INSERT OR REPLACE INTO LiveSignals 
                     (userId, signal_id, signal_source, signal_type, asset_symbol, signal_title,
                      confidence_score, signal_strength, priority_level, current_price, signal_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, signal["signal_id"], signal["signal_source"], signal["signal_type"],
                     signal["asset_symbol"], signal["signal_title"], signal["confidence_score"],
@@ -255,7 +257,7 @@ async def get_live_signals(user_id: int = 1):
             # Re-fetch data
             cursor.execute("""
                 SELECT * FROM LiveSignals 
-                WHERE userId = ? AND signal_status = 'active'
+                WHERE userId = %s AND signal_status = 'active'
                 ORDER BY signal_timestamp DESC
                 LIMIT 50
             """, (user_id,))
@@ -282,7 +284,7 @@ async def add_live_signal(signal: LiveSignal = Body(...), user_id: int = 1):
             INSERT OR REPLACE INTO LiveSignals 
             (userId, signal_id, signal_source, signal_type, asset_symbol, signal_title,
              confidence_score, signal_strength, priority_level, current_price, signal_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id, signal.signalId, signal.signalSource, signal.signalType,
             signal.assetSymbol, signal.signalTitle, signal.confidenceScore,
@@ -313,7 +315,7 @@ async def get_signal_summary(user_id: int = 1):
                 COUNT(CASE WHEN priority_level = 'high' THEN 1 END) as high_priority,
                 AVG(confidence_score) as avg_confidence
             FROM LiveSignals 
-            WHERE userId = ? AND signal_status = 'active'
+            WHERE userId = %s AND signal_status = 'active'
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -328,4 +330,4 @@ async def get_signal_summary(user_id: int = 1):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))          

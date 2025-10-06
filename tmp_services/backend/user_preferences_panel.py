@@ -15,8 +15,9 @@ from typing import Dict, Any, Optional, List
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -123,8 +124,8 @@ class NotificationPreferences(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -135,7 +136,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_16",
@@ -165,7 +166,7 @@ async def get_user_preferences(user_id: int = 1):
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 theme TEXT DEFAULT 'system',
                 language TEXT DEFAULT 'en',
@@ -218,7 +219,7 @@ async def get_user_preferences(user_id: int = 1):
         """)
         
         # Get user preferences
-        cursor.execute("SELECT * FROM UserPreferences WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT * FROM UserPreferences WHERE userId = %s", (user_id,))
         result = cursor.fetchone()
         
         if not result:
@@ -226,12 +227,12 @@ async def get_user_preferences(user_id: int = 1):
             default_prefs = UserPreferences()
             cursor.execute("""
                 INSERT INTO UserPreferences (userId, theme, language, base_currency)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
             """, (user_id, default_prefs.theme, default_prefs.language, default_prefs.base_currency))
             conn.commit()
             
             # Fetch the created preferences
-            cursor.execute("SELECT * FROM UserPreferences WHERE userId = ?", (user_id,))
+            cursor.execute("SELECT * FROM UserPreferences WHERE userId = %s", (user_id,))
             result = cursor.fetchone()
         
         columns = [description[0] for description in cursor.description]
@@ -316,52 +317,52 @@ async def update_user_preferences(
         # Update preferences
         cursor.execute("""
             UPDATE UserPreferences 
-            SET theme = ?,
-                language = ?,
-                timezone = ?,
-                date_format = ?,
-                time_format = ?,
-                number_format = ?,
-                base_currency = ?,
-                secondary_currency = ?,
-                currency_display_format = ?,
-                dashboard_layout = ?,
-                sidebar_collapsed = ?,
-                panel_arrangement = ?,
-                default_page = ?,
-                auto_refresh_enabled = ?,
-                auto_refresh_interval = ?,
-                data_retention_days = ?,
-                cache_enabled = ?,
-                email_notifications = ?,
-                push_notifications = ?,
-                sms_notifications = ?,
-                default_order_type = ?,
-                confirm_trades = ?,
-                show_advanced_trading = ?,
-                paper_trading_default = ?,
-                default_chart_type = ?,
-                chart_theme = ?,
-                show_volume = ?,
-                show_indicators = ?,
-                chart_timeframe = ?,
-                profile_visibility = ?,
-                show_performance = ?,
-                show_holdings = ?,
-                analytics_tracking = ?,
-                high_contrast = ?,
-                large_text = ?,
-                reduce_motion = ?,
-                screen_reader_support = ?,
-                lazy_loading = ?,
-                image_optimization = ?,
-                animation_enabled = ?,
-                transition_speed = ?,
-                debug_mode = ?,
-                beta_features = ?,
-                developer_mode = ?,
+            SET theme = %s,
+                language = %s,
+                timezone = %s,
+                date_format = %s,
+                time_format = %s,
+                number_format = %s,
+                base_currency = %s,
+                secondary_currency = %s,
+                currency_display_format = %s,
+                dashboard_layout = %s,
+                sidebar_collapsed = %s,
+                panel_arrangement = %s,
+                default_page = %s,
+                auto_refresh_enabled = %s,
+                auto_refresh_interval = %s,
+                data_retention_days = %s,
+                cache_enabled = %s,
+                email_notifications = %s,
+                push_notifications = %s,
+                sms_notifications = %s,
+                default_order_type = %s,
+                confirm_trades = %s,
+                show_advanced_trading = %s,
+                paper_trading_default = %s,
+                default_chart_type = %s,
+                chart_theme = %s,
+                show_volume = %s,
+                show_indicators = %s,
+                chart_timeframe = %s,
+                profile_visibility = %s,
+                show_performance = %s,
+                show_holdings = %s,
+                analytics_tracking = %s,
+                high_contrast = %s,
+                large_text = %s,
+                reduce_motion = %s,
+                screen_reader_support = %s,
+                lazy_loading = %s,
+                image_optimization = %s,
+                animation_enabled = %s,
+                transition_speed = %s,
+                debug_mode = %s,
+                beta_features = %s,
+                developer_mode = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             preferences.get('theme', 'system'),
             preferences.get('language', 'en'),
@@ -437,7 +438,7 @@ async def get_theme_preferences(user_id: int = 1):
         # Create theme preferences table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserThemePreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 theme_mode TEXT DEFAULT 'system',
                 color_scheme TEXT DEFAULT 'default',
@@ -456,17 +457,17 @@ async def get_theme_preferences(user_id: int = 1):
             )
         """)
         
-        cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = %s", (user_id,))
         result = cursor.fetchone()
         
         if not result:
             # Create default theme preferences
             cursor.execute("""
-                INSERT INTO UserThemePreferences (userId) VALUES (?)
+                INSERT INTO UserThemePreferences (userId) VALUES (%s)
             """, (user_id,))
             conn.commit()
             
-            cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = ?", (user_id,))
+            cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = %s", (user_id,))
             result = cursor.fetchone()
         
         columns = [description[0] for description in cursor.description]
@@ -503,19 +504,19 @@ async def update_theme_preferences(
         
         cursor.execute("""
             UPDATE UserThemePreferences 
-            SET theme_mode = ?,
-                color_scheme = ?,
-                accent_color = ?,
-                primary_color = ?,
-                secondary_color = ?,
-                font_family = ?,
-                font_size = ?,
-                font_weight = ?,
-                container_width = ?,
-                border_radius = ?,
-                custom_css = ?,
+            SET theme_mode = %s,
+                color_scheme = %s,
+                accent_color = %s,
+                primary_color = %s,
+                secondary_color = %s,
+                font_family = %s,
+                font_size = %s,
+                font_weight = %s,
+                container_width = %s,
+                border_radius = %s,
+                custom_css = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             theme_prefs.get('themeMode', 'system'),
             theme_prefs.get('colorScheme', 'default'),
@@ -559,10 +560,10 @@ async def reset_user_preferences(
         cursor = conn.cursor()
         
         if category == "theme" or category is None:
-            cursor.execute("DELETE FROM UserThemePreferences WHERE userId = ?", (user_id,))
+            cursor.execute("DELETE FROM UserThemePreferences WHERE userId = %s", (user_id,))
             
         if category == "general" or category is None:
-            cursor.execute("DELETE FROM UserPreferences WHERE userId = ?", (user_id,))
+            cursor.execute("DELETE FROM UserPreferences WHERE userId = %s", (user_id,))
         
         conn.commit()
         conn.close()
@@ -662,8 +663,9 @@ from typing import Dict, Any, Optional, List
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -770,8 +772,8 @@ class NotificationPreferences(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -782,7 +784,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_16",
@@ -812,7 +814,7 @@ async def get_user_preferences(user_id: int = 1):
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 theme TEXT DEFAULT 'system',
                 language TEXT DEFAULT 'en',
@@ -865,7 +867,7 @@ async def get_user_preferences(user_id: int = 1):
         """)
         
         # Get user preferences
-        cursor.execute("SELECT * FROM UserPreferences WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT * FROM UserPreferences WHERE userId = %s", (user_id,))
         result = cursor.fetchone()
         
         if not result:
@@ -873,12 +875,12 @@ async def get_user_preferences(user_id: int = 1):
             default_prefs = UserPreferences()
             cursor.execute("""
                 INSERT INTO UserPreferences (userId, theme, language, base_currency)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
             """, (user_id, default_prefs.theme, default_prefs.language, default_prefs.base_currency))
             conn.commit()
             
             # Fetch the created preferences
-            cursor.execute("SELECT * FROM UserPreferences WHERE userId = ?", (user_id,))
+            cursor.execute("SELECT * FROM UserPreferences WHERE userId = %s", (user_id,))
             result = cursor.fetchone()
         
         columns = [description[0] for description in cursor.description]
@@ -963,52 +965,52 @@ async def update_user_preferences(
         # Update preferences
         cursor.execute("""
             UPDATE UserPreferences 
-            SET theme = ?,
-                language = ?,
-                timezone = ?,
-                date_format = ?,
-                time_format = ?,
-                number_format = ?,
-                base_currency = ?,
-                secondary_currency = ?,
-                currency_display_format = ?,
-                dashboard_layout = ?,
-                sidebar_collapsed = ?,
-                panel_arrangement = ?,
-                default_page = ?,
-                auto_refresh_enabled = ?,
-                auto_refresh_interval = ?,
-                data_retention_days = ?,
-                cache_enabled = ?,
-                email_notifications = ?,
-                push_notifications = ?,
-                sms_notifications = ?,
-                default_order_type = ?,
-                confirm_trades = ?,
-                show_advanced_trading = ?,
-                paper_trading_default = ?,
-                default_chart_type = ?,
-                chart_theme = ?,
-                show_volume = ?,
-                show_indicators = ?,
-                chart_timeframe = ?,
-                profile_visibility = ?,
-                show_performance = ?,
-                show_holdings = ?,
-                analytics_tracking = ?,
-                high_contrast = ?,
-                large_text = ?,
-                reduce_motion = ?,
-                screen_reader_support = ?,
-                lazy_loading = ?,
-                image_optimization = ?,
-                animation_enabled = ?,
-                transition_speed = ?,
-                debug_mode = ?,
-                beta_features = ?,
-                developer_mode = ?,
+            SET theme = %s,
+                language = %s,
+                timezone = %s,
+                date_format = %s,
+                time_format = %s,
+                number_format = %s,
+                base_currency = %s,
+                secondary_currency = %s,
+                currency_display_format = %s,
+                dashboard_layout = %s,
+                sidebar_collapsed = %s,
+                panel_arrangement = %s,
+                default_page = %s,
+                auto_refresh_enabled = %s,
+                auto_refresh_interval = %s,
+                data_retention_days = %s,
+                cache_enabled = %s,
+                email_notifications = %s,
+                push_notifications = %s,
+                sms_notifications = %s,
+                default_order_type = %s,
+                confirm_trades = %s,
+                show_advanced_trading = %s,
+                paper_trading_default = %s,
+                default_chart_type = %s,
+                chart_theme = %s,
+                show_volume = %s,
+                show_indicators = %s,
+                chart_timeframe = %s,
+                profile_visibility = %s,
+                show_performance = %s,
+                show_holdings = %s,
+                analytics_tracking = %s,
+                high_contrast = %s,
+                large_text = %s,
+                reduce_motion = %s,
+                screen_reader_support = %s,
+                lazy_loading = %s,
+                image_optimization = %s,
+                animation_enabled = %s,
+                transition_speed = %s,
+                debug_mode = %s,
+                beta_features = %s,
+                developer_mode = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             preferences.get('theme', 'system'),
             preferences.get('language', 'en'),
@@ -1084,7 +1086,7 @@ async def get_theme_preferences(user_id: int = 1):
         # Create theme preferences table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserThemePreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 theme_mode TEXT DEFAULT 'system',
                 color_scheme TEXT DEFAULT 'default',
@@ -1103,17 +1105,17 @@ async def get_theme_preferences(user_id: int = 1):
             )
         """)
         
-        cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = %s", (user_id,))
         result = cursor.fetchone()
         
         if not result:
             # Create default theme preferences
             cursor.execute("""
-                INSERT INTO UserThemePreferences (userId) VALUES (?)
+                INSERT INTO UserThemePreferences (userId) VALUES (%s)
             """, (user_id,))
             conn.commit()
             
-            cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = ?", (user_id,))
+            cursor.execute("SELECT * FROM UserThemePreferences WHERE userId = %s", (user_id,))
             result = cursor.fetchone()
         
         columns = [description[0] for description in cursor.description]
@@ -1150,19 +1152,19 @@ async def update_theme_preferences(
         
         cursor.execute("""
             UPDATE UserThemePreferences 
-            SET theme_mode = ?,
-                color_scheme = ?,
-                accent_color = ?,
-                primary_color = ?,
-                secondary_color = ?,
-                font_family = ?,
-                font_size = ?,
-                font_weight = ?,
-                container_width = ?,
-                border_radius = ?,
-                custom_css = ?,
+            SET theme_mode = %s,
+                color_scheme = %s,
+                accent_color = %s,
+                primary_color = %s,
+                secondary_color = %s,
+                font_family = %s,
+                font_size = %s,
+                font_weight = %s,
+                container_width = %s,
+                border_radius = %s,
+                custom_css = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             theme_prefs.get('themeMode', 'system'),
             theme_prefs.get('colorScheme', 'default'),
@@ -1206,10 +1208,10 @@ async def reset_user_preferences(
         cursor = conn.cursor()
         
         if category == "theme" or category is None:
-            cursor.execute("DELETE FROM UserThemePreferences WHERE userId = ?", (user_id,))
+            cursor.execute("DELETE FROM UserThemePreferences WHERE userId = %s", (user_id,))
             
         if category == "general" or category is None:
-            cursor.execute("DELETE FROM UserPreferences WHERE userId = ?", (user_id,))
+            cursor.execute("DELETE FROM UserPreferences WHERE userId = %s", (user_id,))
         
         conn.commit()
         conn.close()
@@ -1292,4 +1294,4 @@ async def import_user_preferences(
         return {"success": True, "message": "Preferences imported successfully"}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            

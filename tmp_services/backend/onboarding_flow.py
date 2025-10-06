@@ -15,8 +15,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -124,8 +125,8 @@ class TradingPreferences(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -136,7 +137,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_15",
@@ -166,7 +167,7 @@ async def get_onboarding_progress(user_id: int = 1):
         # Create onboarding progress table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserOnboardingProgress (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 current_step INTEGER DEFAULT 1,
                 completed_steps TEXT DEFAULT '[]',
@@ -219,7 +220,7 @@ async def get_onboarding_progress(user_id: int = 1):
         
         # Get user's onboarding progress
         cursor.execute("""
-            SELECT * FROM UserOnboardingProgress WHERE userId = ?
+            SELECT * FROM UserOnboardingProgress WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -229,7 +230,7 @@ async def get_onboarding_progress(user_id: int = 1):
             cursor.execute("""
                 INSERT INTO UserOnboardingProgress 
                 (userId, current_step, completion_percentage, welcome_viewed)
-                VALUES (?, 1, 0.0, FALSE)
+                VALUES (%s, 1, 0.0, FALSE)
             """, (user_id,))
             
             conn.commit()
@@ -340,7 +341,7 @@ async def update_onboarding_step(
         # Get current progress
         cursor.execute("""
             SELECT current_step, completed_steps FROM UserOnboardingProgress 
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -365,27 +366,27 @@ async def update_onboarding_step(
                 SET welcome_viewed = TRUE,
                     welcome_viewed_at = CURRENT_TIMESTAMP,
                     current_step = CASE WHEN current_step < 2 THEN 2 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (json.dumps(completed_steps), completion_percentage, user_id))
             
         elif step_number == 2:
             # Portfolio preferences step
             cursor.execute("""
                 UPDATE UserOnboardingProgress 
-                SET trading_experience = ?,
-                    risk_tolerance = ?,
-                    investment_horizon = ?,
-                    initial_investment = ?,
-                    trading_frequency = ?,
-                    preferred_markets = ?,
+                SET trading_experience = %s,
+                    risk_tolerance = %s,
+                    investment_horizon = %s,
+                    initial_investment = %s,
+                    trading_frequency = %s,
+                    preferred_markets = %s,
                     current_step = CASE WHEN current_step < 3 THEN 3 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (
                 step_data.get("tradingExperience"),
                 step_data.get("riskTolerance"),
@@ -402,17 +403,17 @@ async def update_onboarding_step(
             # Personal information step
             cursor.execute("""
                 UPDATE UserOnboardingProgress 
-                SET full_name = ?,
-                    first_name = ?,
-                    last_name = ?,
-                    phone_number = ?,
-                    preferred_currency = ?,
-                    date_of_birth = ?,
+                SET full_name = %s,
+                    first_name = %s,
+                    last_name = %s,
+                    phone_number = %s,
+                    preferred_currency = %s,
+                    date_of_birth = %s,
                     current_step = CASE WHEN current_step < 4 THEN 4 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (
                 step_data.get("fullName"),
                 step_data.get("firstName"),
@@ -429,18 +430,18 @@ async def update_onboarding_step(
             # Tax information step
             cursor.execute("""
                 UPDATE UserOnboardingProgress 
-                SET tax_residency = ?,
-                    secondary_tax_residency = ?,
-                    tax_identification_number = ?,
-                    tax_file_number = ?,
-                    employment_status = ?,
-                    tax_year_preference = ?,
-                    tax_registered_business = ?,
+                SET tax_residency = %s,
+                    secondary_tax_residency = %s,
+                    tax_identification_number = %s,
+                    tax_file_number = %s,
+                    employment_status = %s,
+                    tax_year_preference = %s,
+                    tax_registered_business = %s,
                     current_step = CASE WHEN current_step < 5 THEN 5 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (
                 step_data.get("taxResidency"),
                 step_data.get("secondaryTaxResidency"),
@@ -465,10 +466,10 @@ async def update_onboarding_step(
                     is_complete = TRUE,
                     completed_at = CURRENT_TIMESTAMP,
                     current_step = 5,
-                    completed_steps = ?,
+                    completed_steps = %s,
                     completion_percentage = 100.0,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (json.dumps(completed_steps), user_id))
         
         conn.commit()
@@ -530,7 +531,7 @@ async def complete_onboarding(
         # Create trading preferences table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserTradingPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 trading_style TEXT DEFAULT 'balanced',
                 strategy_preference TEXT DEFAULT 'mixed',
@@ -575,9 +576,12 @@ async def complete_onboarding(
             trading_style = "aggressive"
         
         cursor.execute("""
-            INSERT OR REPLACE INTO UserTradingPreferences 
+            INSERT INTO UserTradingPreferences 
             (userId, trading_style, base_currency, auto_rebalance_enabled, paper_trading_enabled)
-            VALUES (?, ?, ?, TRUE, TRUE)
+            VALUES (%s, %s, %s, TRUE, TRUE)
+            ON CONFLICT (userId) DO UPDATE SET
+                trading_style = EXCLUDED.trading_style,
+                base_currency = EXCLUDED.base_currency
         """, (
             user_id,
             trading_style,
@@ -589,7 +593,7 @@ async def complete_onboarding(
             UPDATE User 
             SET onboardingComplete = TRUE,
                 onboardingStep = 5
-            WHERE id = ?
+            WHERE id = %s
         """, (user_id,))
         
         conn.commit()
@@ -717,7 +721,7 @@ async def get_onboarding_analytics(
         # Create analytics table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserOnboardingAnalytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 step_number INTEGER NOT NULL,
                 step_name TEXT NOT NULL,
@@ -747,7 +751,7 @@ async def get_onboarding_analytics(
                 COALESCE(SUM(help_requests), 0) as help_requests_total,
                 COALESCE(SUM(retry_count), 0) as retry_count_total
             FROM UserOnboardingAnalytics
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -767,7 +771,7 @@ async def get_onboarding_analytics(
         cursor.execute("""
             SELECT step_number, step_name, time_spent_seconds, completion_method, help_requests, retry_count
             FROM UserOnboardingAnalytics
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY step_number
         """, (user_id,))
         
@@ -816,7 +820,7 @@ async def get_trading_preferences(user_id: int = 1):
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT * FROM UserTradingPreferences WHERE userId = ?
+            SELECT * FROM UserTradingPreferences WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -892,37 +896,37 @@ async def update_trading_preferences(
         # Update trading preferences
         cursor.execute("""
             UPDATE UserTradingPreferences 
-            SET trading_style = ?,
-                strategy_preference = ?,
-                position_sizing_method = ?,
-                default_position_size = ?,
-                max_position_size = ?,
-                stop_loss_percentage = ?,
-                take_profit_percentage = ?,
-                max_daily_trades = ?,
-                max_weekly_trades = ?,
-                cash_allocation_target = ?,
-                equity_allocation_target = ?,
-                bond_allocation_target = ?,
-                alternative_allocation_target = ?,
-                auto_rebalance_enabled = ?,
-                rebalance_threshold = ?,
-                rebalance_frequency = ?,
-                base_currency = ?,
-                currency_hedging_preference = ?,
-                tax_loss_harvesting_enabled = ?,
-                franking_credits_consideration = ?,
-                nz_tax_optimization = ?,
-                price_alert_threshold = ?,
-                portfolio_alert_threshold = ?,
-                news_alert_enabled = ?,
-                signal_alert_enabled = ?,
-                auto_save_enabled = ?,
-                advanced_mode_enabled = ?,
-                paper_trading_enabled = ?,
-                real_trading_enabled = ?,
+            SET trading_style = %s,
+                strategy_preference = %s,
+                position_sizing_method = %s,
+                default_position_size = %s,
+                max_position_size = %s,
+                stop_loss_percentage = %s,
+                take_profit_percentage = %s,
+                max_daily_trades = %s,
+                max_weekly_trades = %s,
+                cash_allocation_target = %s,
+                equity_allocation_target = %s,
+                bond_allocation_target = %s,
+                alternative_allocation_target = %s,
+                auto_rebalance_enabled = %s,
+                rebalance_threshold = %s,
+                rebalance_frequency = %s,
+                base_currency = %s,
+                currency_hedging_preference = %s,
+                tax_loss_harvesting_enabled = %s,
+                franking_credits_consideration = %s,
+                nz_tax_optimization = %s,
+                price_alert_threshold = %s,
+                portfolio_alert_threshold = %s,
+                news_alert_enabled = %s,
+                signal_alert_enabled = %s,
+                auto_save_enabled = %s,
+                advanced_mode_enabled = %s,
+                paper_trading_enabled = %s,
+                real_trading_enabled = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             preferences.get('tradingStyle', 'balanced'),
             preferences.get('strategyPreference', 'mixed'),
@@ -1015,7 +1019,7 @@ async def reset_onboarding(user_id: int = 1):
                 completed_at = NULL,
                 last_active_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         # Update user table
@@ -1023,7 +1027,7 @@ async def reset_onboarding(user_id: int = 1):
             UPDATE User 
             SET onboardingComplete = FALSE,
                 onboardingStep = 1
-            WHERE id = ?
+            WHERE id = %s
         """, (user_id,))
         
         conn.commit()
@@ -1063,8 +1067,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -1172,8 +1177,8 @@ class TradingPreferences(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -1184,7 +1189,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_15",
@@ -1214,7 +1219,7 @@ async def get_onboarding_progress(user_id: int = 1):
         # Create onboarding progress table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserOnboardingProgress (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 current_step INTEGER DEFAULT 1,
                 completed_steps TEXT DEFAULT '[]',
@@ -1267,7 +1272,7 @@ async def get_onboarding_progress(user_id: int = 1):
         
         # Get user's onboarding progress
         cursor.execute("""
-            SELECT * FROM UserOnboardingProgress WHERE userId = ?
+            SELECT * FROM UserOnboardingProgress WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -1277,7 +1282,7 @@ async def get_onboarding_progress(user_id: int = 1):
             cursor.execute("""
                 INSERT INTO UserOnboardingProgress 
                 (userId, current_step, completion_percentage, welcome_viewed)
-                VALUES (?, 1, 0.0, FALSE)
+                VALUES (%s, 1, 0.0, FALSE)
             """, (user_id,))
             
             conn.commit()
@@ -1388,7 +1393,7 @@ async def update_onboarding_step(
         # Get current progress
         cursor.execute("""
             SELECT current_step, completed_steps FROM UserOnboardingProgress 
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -1413,27 +1418,27 @@ async def update_onboarding_step(
                 SET welcome_viewed = TRUE,
                     welcome_viewed_at = CURRENT_TIMESTAMP,
                     current_step = CASE WHEN current_step < 2 THEN 2 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (json.dumps(completed_steps), completion_percentage, user_id))
             
         elif step_number == 2:
             # Portfolio preferences step
             cursor.execute("""
                 UPDATE UserOnboardingProgress 
-                SET trading_experience = ?,
-                    risk_tolerance = ?,
-                    investment_horizon = ?,
-                    initial_investment = ?,
-                    trading_frequency = ?,
-                    preferred_markets = ?,
+                SET trading_experience = %s,
+                    risk_tolerance = %s,
+                    investment_horizon = %s,
+                    initial_investment = %s,
+                    trading_frequency = %s,
+                    preferred_markets = %s,
                     current_step = CASE WHEN current_step < 3 THEN 3 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (
                 step_data.get("tradingExperience"),
                 step_data.get("riskTolerance"),
@@ -1450,17 +1455,17 @@ async def update_onboarding_step(
             # Personal information step
             cursor.execute("""
                 UPDATE UserOnboardingProgress 
-                SET full_name = ?,
-                    first_name = ?,
-                    last_name = ?,
-                    phone_number = ?,
-                    preferred_currency = ?,
-                    date_of_birth = ?,
+                SET full_name = %s,
+                    first_name = %s,
+                    last_name = %s,
+                    phone_number = %s,
+                    preferred_currency = %s,
+                    date_of_birth = %s,
                     current_step = CASE WHEN current_step < 4 THEN 4 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (
                 step_data.get("fullName"),
                 step_data.get("firstName"),
@@ -1477,18 +1482,18 @@ async def update_onboarding_step(
             # Tax information step
             cursor.execute("""
                 UPDATE UserOnboardingProgress 
-                SET tax_residency = ?,
-                    secondary_tax_residency = ?,
-                    tax_identification_number = ?,
-                    tax_file_number = ?,
-                    employment_status = ?,
-                    tax_year_preference = ?,
-                    tax_registered_business = ?,
+                SET tax_residency = %s,
+                    secondary_tax_residency = %s,
+                    tax_identification_number = %s,
+                    tax_file_number = %s,
+                    employment_status = %s,
+                    tax_year_preference = %s,
+                    tax_registered_business = %s,
                     current_step = CASE WHEN current_step < 5 THEN 5 ELSE current_step END,
-                    completed_steps = ?,
-                    completion_percentage = ?,
+                    completed_steps = %s,
+                    completion_percentage = %s,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (
                 step_data.get("taxResidency"),
                 step_data.get("secondaryTaxResidency"),
@@ -1513,10 +1518,10 @@ async def update_onboarding_step(
                     is_complete = TRUE,
                     completed_at = CURRENT_TIMESTAMP,
                     current_step = 5,
-                    completed_steps = ?,
+                    completed_steps = %s,
                     completion_percentage = 100.0,
                     last_active_at = CURRENT_TIMESTAMP
-                WHERE userId = ?
+                WHERE userId = %s
             """, (json.dumps(completed_steps), user_id))
         
         conn.commit()
@@ -1578,7 +1583,7 @@ async def complete_onboarding(
         # Create trading preferences table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserTradingPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 trading_style TEXT DEFAULT 'balanced',
                 strategy_preference TEXT DEFAULT 'mixed',
@@ -1623,9 +1628,12 @@ async def complete_onboarding(
             trading_style = "aggressive"
         
         cursor.execute("""
-            INSERT OR REPLACE INTO UserTradingPreferences 
+            INSERT INTO UserTradingPreferences 
             (userId, trading_style, base_currency, auto_rebalance_enabled, paper_trading_enabled)
-            VALUES (?, ?, ?, TRUE, TRUE)
+            VALUES (%s, %s, %s, TRUE, TRUE)
+            ON CONFLICT (userId) DO UPDATE SET
+                trading_style = EXCLUDED.trading_style,
+                base_currency = EXCLUDED.base_currency
         """, (
             user_id,
             trading_style,
@@ -1637,7 +1645,7 @@ async def complete_onboarding(
             UPDATE User 
             SET onboardingComplete = TRUE,
                 onboardingStep = 5
-            WHERE id = ?
+            WHERE id = %s
         """, (user_id,))
         
         conn.commit()
@@ -1765,7 +1773,7 @@ async def get_onboarding_analytics(
         # Create analytics table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserOnboardingAnalytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 step_number INTEGER NOT NULL,
                 step_name TEXT NOT NULL,
@@ -1795,7 +1803,7 @@ async def get_onboarding_analytics(
                 COALESCE(SUM(help_requests), 0) as help_requests_total,
                 COALESCE(SUM(retry_count), 0) as retry_count_total
             FROM UserOnboardingAnalytics
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -1815,7 +1823,7 @@ async def get_onboarding_analytics(
         cursor.execute("""
             SELECT step_number, step_name, time_spent_seconds, completion_method, help_requests, retry_count
             FROM UserOnboardingAnalytics
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY step_number
         """, (user_id,))
         
@@ -1864,7 +1872,7 @@ async def get_trading_preferences(user_id: int = 1):
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT * FROM UserTradingPreferences WHERE userId = ?
+            SELECT * FROM UserTradingPreferences WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -1940,37 +1948,37 @@ async def update_trading_preferences(
         # Update trading preferences
         cursor.execute("""
             UPDATE UserTradingPreferences 
-            SET trading_style = ?,
-                strategy_preference = ?,
-                position_sizing_method = ?,
-                default_position_size = ?,
-                max_position_size = ?,
-                stop_loss_percentage = ?,
-                take_profit_percentage = ?,
-                max_daily_trades = ?,
-                max_weekly_trades = ?,
-                cash_allocation_target = ?,
-                equity_allocation_target = ?,
-                bond_allocation_target = ?,
-                alternative_allocation_target = ?,
-                auto_rebalance_enabled = ?,
-                rebalance_threshold = ?,
-                rebalance_frequency = ?,
-                base_currency = ?,
-                currency_hedging_preference = ?,
-                tax_loss_harvesting_enabled = ?,
-                franking_credits_consideration = ?,
-                nz_tax_optimization = ?,
-                price_alert_threshold = ?,
-                portfolio_alert_threshold = ?,
-                news_alert_enabled = ?,
-                signal_alert_enabled = ?,
-                auto_save_enabled = ?,
-                advanced_mode_enabled = ?,
-                paper_trading_enabled = ?,
-                real_trading_enabled = ?,
+            SET trading_style = %s,
+                strategy_preference = %s,
+                position_sizing_method = %s,
+                default_position_size = %s,
+                max_position_size = %s,
+                stop_loss_percentage = %s,
+                take_profit_percentage = %s,
+                max_daily_trades = %s,
+                max_weekly_trades = %s,
+                cash_allocation_target = %s,
+                equity_allocation_target = %s,
+                bond_allocation_target = %s,
+                alternative_allocation_target = %s,
+                auto_rebalance_enabled = %s,
+                rebalance_threshold = %s,
+                rebalance_frequency = %s,
+                base_currency = %s,
+                currency_hedging_preference = %s,
+                tax_loss_harvesting_enabled = %s,
+                franking_credits_consideration = %s,
+                nz_tax_optimization = %s,
+                price_alert_threshold = %s,
+                portfolio_alert_threshold = %s,
+                news_alert_enabled = %s,
+                signal_alert_enabled = %s,
+                auto_save_enabled = %s,
+                advanced_mode_enabled = %s,
+                paper_trading_enabled = %s,
+                real_trading_enabled = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             preferences.get('tradingStyle', 'balanced'),
             preferences.get('strategyPreference', 'mixed'),
@@ -2063,7 +2071,7 @@ async def reset_onboarding(user_id: int = 1):
                 completed_at = NULL,
                 last_active_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (user_id,))
         
         # Update user table
@@ -2071,7 +2079,7 @@ async def reset_onboarding(user_id: int = 1):
             UPDATE User 
             SET onboardingComplete = FALSE,
                 onboardingStep = 1
-            WHERE id = ?
+            WHERE id = %s
         """, (user_id,))
         
         conn.commit()
@@ -2094,4 +2102,4 @@ async def reset_onboarding(user_id: int = 1):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            

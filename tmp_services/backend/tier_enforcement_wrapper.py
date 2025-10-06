@@ -5,8 +5,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -47,8 +48,8 @@ class WrapperRule(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -59,7 +60,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_38",
@@ -92,7 +93,7 @@ async def get_wrapper_configs(
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperConfig (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 wrapper_name TEXT NOT NULL,
                 wrapper_type TEXT NOT NULL,
@@ -118,7 +119,7 @@ async def get_wrapper_configs(
         params = [user_id]
         
         if wrapper_type:
-            where_clause += " AND wrapper_type = ?"
+            where_clause += " AND wrapper_type = %s"
             params.append(wrapper_type)
         
         cursor.execute(f"""
@@ -187,7 +188,7 @@ async def create_wrapper_config(
             (userId, wrapper_name, wrapper_type, target_identifier, enforcement_enabled, 
              strict_mode, minimum_tier_level, required_permissions, on_violation_action,
              fallback_component, redirect_url, custom_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             config.wrapperName,
@@ -241,7 +242,7 @@ async def check_access(
         # Get wrapper configuration
         cursor.execute("""
             SELECT * FROM TierEnforcementWrapperConfig 
-            WHERE wrapper_name = ? AND target_identifier = ? AND enforcement_enabled = TRUE
+            WHERE wrapper_name = %s AND target_identifier = %s AND enforcement_enabled = TRUE
         """, (request.wrapperName, request.targetIdentifier))
         
         config_data = cursor.fetchone()
@@ -294,7 +295,7 @@ async def check_access(
         # Log access attempt
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperInstances (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 wrapper_config_id INTEGER,
                 userId INTEGER NOT NULL,
                 instance_id TEXT NOT NULL,
@@ -316,7 +317,7 @@ async def check_access(
             (wrapper_config_id, userId, instance_id, session_id, user_tier_level,
              user_permissions, access_granted, violation_reason, action_taken,
              request_path, check_duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             config_data[0] if config_data else None,
             user_id,
@@ -374,7 +375,7 @@ async def get_wrapper_rules(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperRules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 rule_name TEXT NOT NULL,
                 rule_description TEXT,
@@ -443,7 +444,7 @@ async def create_wrapper_rule(
             INSERT INTO TierEnforcementWrapperRules 
             (userId, rule_name, rule_description, condition_type, condition_config,
              action_type, action_config, applies_to_wrappers)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             rule.ruleName,
@@ -590,7 +591,7 @@ async def get_wrapper_settings(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperSettings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 global_enforcement_enabled BOOLEAN DEFAULT TRUE,
                 debug_mode BOOLEAN DEFAULT FALSE,
@@ -615,7 +616,7 @@ async def get_wrapper_settings(user_id: int = 1):
         if not result:
             # Create default settings
             cursor.execute("""
-                INSERT INTO TierEnforcementWrapperSettings (userId) VALUES (?)
+                INSERT INTO TierEnforcementWrapperSettings (userId) VALUES (%s)
             """, (user_id,))
             conn.commit()
             
@@ -703,8 +704,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -745,8 +747,8 @@ class WrapperRule(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -757,7 +759,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_38",
@@ -790,7 +792,7 @@ async def get_wrapper_configs(
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperConfig (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 wrapper_name TEXT NOT NULL,
                 wrapper_type TEXT NOT NULL,
@@ -816,7 +818,7 @@ async def get_wrapper_configs(
         params = [user_id]
         
         if wrapper_type:
-            where_clause += " AND wrapper_type = ?"
+            where_clause += " AND wrapper_type = %s"
             params.append(wrapper_type)
         
         cursor.execute(f"""
@@ -885,7 +887,7 @@ async def create_wrapper_config(
             (userId, wrapper_name, wrapper_type, target_identifier, enforcement_enabled, 
              strict_mode, minimum_tier_level, required_permissions, on_violation_action,
              fallback_component, redirect_url, custom_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             config.wrapperName,
@@ -939,7 +941,7 @@ async def check_access(
         # Get wrapper configuration
         cursor.execute("""
             SELECT * FROM TierEnforcementWrapperConfig 
-            WHERE wrapper_name = ? AND target_identifier = ? AND enforcement_enabled = TRUE
+            WHERE wrapper_name = %s AND target_identifier = %s AND enforcement_enabled = TRUE
         """, (request.wrapperName, request.targetIdentifier))
         
         config_data = cursor.fetchone()
@@ -992,7 +994,7 @@ async def check_access(
         # Log access attempt
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperInstances (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 wrapper_config_id INTEGER,
                 userId INTEGER NOT NULL,
                 instance_id TEXT NOT NULL,
@@ -1014,7 +1016,7 @@ async def check_access(
             (wrapper_config_id, userId, instance_id, session_id, user_tier_level,
              user_permissions, access_granted, violation_reason, action_taken,
              request_path, check_duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             config_data[0] if config_data else None,
             user_id,
@@ -1072,7 +1074,7 @@ async def get_wrapper_rules(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperRules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 rule_name TEXT NOT NULL,
                 rule_description TEXT,
@@ -1141,7 +1143,7 @@ async def create_wrapper_rule(
             INSERT INTO TierEnforcementWrapperRules 
             (userId, rule_name, rule_description, condition_type, condition_config,
              action_type, action_config, applies_to_wrappers)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             rule.ruleName,
@@ -1288,7 +1290,7 @@ async def get_wrapper_settings(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS TierEnforcementWrapperSettings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 global_enforcement_enabled BOOLEAN DEFAULT TRUE,
                 debug_mode BOOLEAN DEFAULT FALSE,
@@ -1313,7 +1315,7 @@ async def get_wrapper_settings(user_id: int = 1):
         if not result:
             # Create default settings
             cursor.execute("""
-                INSERT INTO TierEnforcementWrapperSettings (userId) VALUES (?)
+                INSERT INTO TierEnforcementWrapperSettings (userId) VALUES (%s)
             """, (user_id,))
             conn.commit()
             
@@ -1394,4 +1396,4 @@ async def update_wrapper_settings(
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))        

@@ -5,8 +5,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -46,8 +47,8 @@ class BulkExclusionOperation(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -58,7 +59,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_37",
@@ -92,7 +93,7 @@ async def get_asset_exclusions(
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS IndividualAssetExclusions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 asset_symbol TEXT NOT NULL,
                 asset_name TEXT,
@@ -128,7 +129,7 @@ async def get_asset_exclusions(
         
         cursor.execute(f"""
             SELECT * FROM IndividualAssetExclusions 
-            WHERE userId = ? {scope_condition} {active_condition}
+            WHERE userId = %s {scope_condition} {active_condition}
             AND (excluded_until IS NULL OR excluded_until > CURRENT_TIMESTAMP)
             ORDER BY excluded_from DESC
         """, (user_id,))
@@ -191,11 +192,11 @@ async def add_asset_exclusion(
         
         # Insert or update the exclusion
         cursor.execute("""
-            INSERT OR REPLACE INTO IndividualAssetExclusions 
+            INSERT INTO IndividualAssetExclusions 
             (userId, asset_symbol, asset_name, asset_type, exclusion_reason, exclusion_category,
              exclude_from_portfolio, exclude_from_trading, exclude_from_watchlist, exclude_from_suggestions,
              excluded_until, notes, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
         """, (
             user_id,
             exclusion.assetSymbol,
@@ -216,7 +217,7 @@ async def add_asset_exclusion(
         # Log to exclusion history
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ExclusionHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 action_type TEXT NOT NULL,
                 exclusion_type TEXT NOT NULL,
@@ -231,7 +232,7 @@ async def add_asset_exclusion(
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'add', 'individual', ?, ?, ?)
+            VALUES (%s, 'add', 'individual', %s, %s, %s)
         """, (user_id, exclusion.assetSymbol, exclusion.assetSymbol, exclusion.exclusionReason))
         
         conn.commit()
@@ -268,10 +269,10 @@ async def update_asset_exclusion(
         
         cursor.execute("""
             UPDATE IndividualAssetExclusions 
-            SET asset_name = ?, asset_type = ?, exclusion_reason = ?, exclusion_category = ?,
-                exclude_from_portfolio = ?, exclude_from_trading = ?, exclude_from_watchlist = ?, exclude_from_suggestions = ?,
-                excluded_until = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            SET asset_name = %s, asset_type = %s, exclusion_reason = %s, exclusion_category = %s,
+                exclude_from_portfolio = %s, exclude_from_trading = %s, exclude_from_watchlist = %s, exclude_from_suggestions = %s,
+                excluded_until = %s, notes = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND userId = %s
         """, (
             exclusion.assetName,
             exclusion.assetType,
@@ -294,7 +295,7 @@ async def update_asset_exclusion(
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'modify', 'individual', ?, ?, ?)
+            VALUES (%s, 'modify', 'individual', %s, %s, %s)
         """, (user_id, exclusion.assetSymbol, exclusion.assetSymbol, "Exclusion updated"))
         
         conn.commit()
@@ -331,7 +332,7 @@ async def remove_asset_exclusion(
         # Get exclusion details for logging
         cursor.execute("""
             SELECT asset_symbol FROM IndividualAssetExclusions 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (int(exclusion_id), user_id))
         
         exclusion_data = cursor.fetchone()
@@ -344,14 +345,14 @@ async def remove_asset_exclusion(
         cursor.execute("""
             UPDATE IndividualAssetExclusions 
             SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (int(exclusion_id), user_id))
         
         # Log to exclusion history
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'remove', 'individual', ?, ?, ?)
+            VALUES (%s, 'remove', 'individual', %s, %s, %s)
         """, (user_id, asset_symbol, asset_symbol, reason))
         
         conn.commit()
@@ -385,7 +386,7 @@ async def get_exclusion_filters(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS CriteriaExclusionFilters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 filter_name TEXT NOT NULL,
                 filter_description TEXT,
@@ -404,7 +405,7 @@ async def get_exclusion_filters(user_id: int = 1):
         
         cursor.execute("""
             SELECT * FROM CriteriaExclusionFilters 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
             ORDER BY filter_name
         """, (user_id,))
         
@@ -454,7 +455,7 @@ async def create_exclusion_filter(
             INSERT INTO CriteriaExclusionFilters 
             (userId, filter_name, filter_description, criteria_type, filter_operator, filter_value,
              apply_to_portfolio, apply_to_trading, apply_to_watchlist)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             filter_data.filterName,
@@ -473,7 +474,7 @@ async def create_exclusion_filter(
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'add', 'filter', ?, ?, ?)
+            VALUES (%s, 'add', 'filter', %s, %s, %s)
         """, (user_id, str(filter_id), filter_data.filterName, "Filter created"))
         
         conn.commit()
@@ -511,7 +512,7 @@ async def bulk_exclude_assets(
         # Create bulk operation record
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS BulkExclusionOperations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 operation_name TEXT NOT NULL,
                 operation_type TEXT NOT NULL,
@@ -529,7 +530,7 @@ async def bulk_exclude_assets(
         cursor.execute("""
             INSERT INTO BulkExclusionOperations 
             (userId, operation_name, operation_type, total_assets)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (user_id, bulk_operation.operationName, bulk_operation.operationType, len(bulk_operation.assetList)))
         
         operation_id = cursor.lastrowid
@@ -542,11 +543,11 @@ async def bulk_exclude_assets(
         for asset_symbol in bulk_operation.assetList:
             try:
                 cursor.execute("""
-                    INSERT OR REPLACE INTO IndividualAssetExclusions 
+                    INSERT INTO IndividualAssetExclusions 
                     (userId, asset_symbol, exclusion_reason, exclusion_category,
                      exclude_from_portfolio, exclude_from_trading, exclude_from_watchlist, exclude_from_suggestions,
                      is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
                 """, (
                     user_id,
                     asset_symbol,
@@ -567,9 +568,9 @@ async def bulk_exclude_assets(
         # Update operation status
         cursor.execute("""
             UPDATE BulkExclusionOperations 
-            SET processed_assets = ?, failed_assets = ?, success_list = ?, failure_list = ?,
+            SET processed_assets = %s, failed_assets = %s, success_list = %s, failure_list = %s,
                 status = 'completed', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = %s
         """, (
             len(success_list),
             len(failure_list), 
@@ -619,7 +620,7 @@ async def check_asset_exclusion(
         
         cursor.execute(f"""
             SELECT * FROM IndividualAssetExclusions 
-            WHERE userId = ? AND asset_symbol = ? AND is_active = TRUE
+            WHERE userId = %s AND asset_symbol = %s AND is_active = TRUE
             AND {scope_column} = TRUE
             AND (excluded_until IS NULL OR excluded_until > CURRENT_TIMESTAMP)
         """, (user_id, asset_symbol))
@@ -671,7 +672,7 @@ async def get_exclusion_impact_analysis(user_id: int = 1):
                 COUNT(CASE WHEN exclusion_category = 'risk' THEN 1 END) as risk_exclusions,
                 COUNT(CASE WHEN exclusion_category = 'ethics' THEN 1 END) as ethics_exclusions
             FROM IndividualAssetExclusions 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         stats = cursor.fetchone()
@@ -684,7 +685,7 @@ async def get_exclusion_impact_analysis(user_id: int = 1):
                 action_reason,
                 action_timestamp
             FROM ExclusionHistory 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY action_timestamp DESC 
             LIMIT 10
         """, (user_id,))
@@ -746,7 +747,7 @@ async def get_exclusion_settings(user_id: int = 1):
         # Create settings table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ExclusionSettings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 enable_automatic_exclusions BOOLEAN DEFAULT FALSE,
                 enable_temporary_exclusions BOOLEAN DEFAULT TRUE,
@@ -769,7 +770,7 @@ async def get_exclusion_settings(user_id: int = 1):
         """)
         
         cursor.execute("""
-            SELECT * FROM ExclusionSettings WHERE userId = ?
+            SELECT * FROM ExclusionSettings WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -777,13 +778,13 @@ async def get_exclusion_settings(user_id: int = 1):
         if not result:
             # Create default settings
             cursor.execute("""
-                INSERT INTO ExclusionSettings (userId) VALUES (?)
+                INSERT INTO ExclusionSettings (userId) VALUES (%s)
             """, (user_id,))
             conn.commit()
             
             # Fetch the default settings
             cursor.execute("""
-                SELECT * FROM ExclusionSettings WHERE userId = ?
+                SELECT * FROM ExclusionSettings WHERE userId = %s
             """, (user_id,))
             result = cursor.fetchone()
         
@@ -826,22 +827,22 @@ async def update_exclusion_settings(
         # Update settings
         cursor.execute("""
             UPDATE ExclusionSettings 
-            SET enable_automatic_exclusions = ?,
-                enable_temporary_exclusions = ?,
-                default_exclusion_duration = ?,
-                notify_on_exclusion_add = ?,
-                notify_on_exclusion_remove = ?,
-                default_portfolio_exclusion = ?,
-                default_trading_exclusion = ?,
-                default_watchlist_exclusion = ?,
-                default_suggestion_exclusion = ?,
-                auto_exclude_poor_performers = ?,
-                poor_performance_threshold = ?,
-                performance_evaluation_period = ?,
-                allow_bulk_operations = ?,
-                max_bulk_operation_size = ?,
+            SET enable_automatic_exclusions = %s,
+                enable_temporary_exclusions = %s,
+                default_exclusion_duration = %s,
+                notify_on_exclusion_add = %s,
+                notify_on_exclusion_remove = %s,
+                default_portfolio_exclusion = %s,
+                default_trading_exclusion = %s,
+                default_watchlist_exclusion = %s,
+                default_suggestion_exclusion = %s,
+                auto_exclude_poor_performers = %s,
+                poor_performance_threshold = %s,
+                performance_evaluation_period = %s,
+                allow_bulk_operations = %s,
+                max_bulk_operation_size = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             settings.get("enableAutomaticExclusions", False),
             settings.get("enableTemporaryExclusions", True),
@@ -891,7 +892,7 @@ async def export_exclusions(user_id: int = 1):
         # Get all exclusions
         cursor.execute("""
             SELECT * FROM IndividualAssetExclusions 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         exclusions = cursor.fetchall()
@@ -900,7 +901,7 @@ async def export_exclusions(user_id: int = 1):
         # Get all filters
         cursor.execute("""
             SELECT * FROM CriteriaExclusionFilters 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         filters = cursor.fetchall()
@@ -935,8 +936,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, date
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -976,8 +978,8 @@ class BulkExclusionOperation(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -988,7 +990,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_37",
@@ -1022,7 +1024,7 @@ async def get_asset_exclusions(
         # Create tables if they don't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS IndividualAssetExclusions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 asset_symbol TEXT NOT NULL,
                 asset_name TEXT,
@@ -1058,7 +1060,7 @@ async def get_asset_exclusions(
         
         cursor.execute(f"""
             SELECT * FROM IndividualAssetExclusions 
-            WHERE userId = ? {scope_condition} {active_condition}
+            WHERE userId = %s {scope_condition} {active_condition}
             AND (excluded_until IS NULL OR excluded_until > CURRENT_TIMESTAMP)
             ORDER BY excluded_from DESC
         """, (user_id,))
@@ -1121,11 +1123,11 @@ async def add_asset_exclusion(
         
         # Insert or update the exclusion
         cursor.execute("""
-            INSERT OR REPLACE INTO IndividualAssetExclusions 
+            INSERT INTO IndividualAssetExclusions 
             (userId, asset_symbol, asset_name, asset_type, exclusion_reason, exclusion_category,
              exclude_from_portfolio, exclude_from_trading, exclude_from_watchlist, exclude_from_suggestions,
              excluded_until, notes, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
         """, (
             user_id,
             exclusion.assetSymbol,
@@ -1146,7 +1148,7 @@ async def add_asset_exclusion(
         # Log to exclusion history
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ExclusionHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 action_type TEXT NOT NULL,
                 exclusion_type TEXT NOT NULL,
@@ -1161,7 +1163,7 @@ async def add_asset_exclusion(
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'add', 'individual', ?, ?, ?)
+            VALUES (%s, 'add', 'individual', %s, %s, %s)
         """, (user_id, exclusion.assetSymbol, exclusion.assetSymbol, exclusion.exclusionReason))
         
         conn.commit()
@@ -1198,10 +1200,10 @@ async def update_asset_exclusion(
         
         cursor.execute("""
             UPDATE IndividualAssetExclusions 
-            SET asset_name = ?, asset_type = ?, exclusion_reason = ?, exclusion_category = ?,
-                exclude_from_portfolio = ?, exclude_from_trading = ?, exclude_from_watchlist = ?, exclude_from_suggestions = ?,
-                excluded_until = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            SET asset_name = %s, asset_type = %s, exclusion_reason = %s, exclusion_category = %s,
+                exclude_from_portfolio = %s, exclude_from_trading = %s, exclude_from_watchlist = %s, exclude_from_suggestions = %s,
+                excluded_until = %s, notes = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND userId = %s
         """, (
             exclusion.assetName,
             exclusion.assetType,
@@ -1224,7 +1226,7 @@ async def update_asset_exclusion(
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'modify', 'individual', ?, ?, ?)
+            VALUES (%s, 'modify', 'individual', %s, %s, %s)
         """, (user_id, exclusion.assetSymbol, exclusion.assetSymbol, "Exclusion updated"))
         
         conn.commit()
@@ -1261,7 +1263,7 @@ async def remove_asset_exclusion(
         # Get exclusion details for logging
         cursor.execute("""
             SELECT asset_symbol FROM IndividualAssetExclusions 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (int(exclusion_id), user_id))
         
         exclusion_data = cursor.fetchone()
@@ -1274,14 +1276,14 @@ async def remove_asset_exclusion(
         cursor.execute("""
             UPDATE IndividualAssetExclusions 
             SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (int(exclusion_id), user_id))
         
         # Log to exclusion history
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'remove', 'individual', ?, ?, ?)
+            VALUES (%s, 'remove', 'individual', %s, %s, %s)
         """, (user_id, asset_symbol, asset_symbol, reason))
         
         conn.commit()
@@ -1315,7 +1317,7 @@ async def get_exclusion_filters(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS CriteriaExclusionFilters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 filter_name TEXT NOT NULL,
                 filter_description TEXT,
@@ -1334,7 +1336,7 @@ async def get_exclusion_filters(user_id: int = 1):
         
         cursor.execute("""
             SELECT * FROM CriteriaExclusionFilters 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
             ORDER BY filter_name
         """, (user_id,))
         
@@ -1384,7 +1386,7 @@ async def create_exclusion_filter(
             INSERT INTO CriteriaExclusionFilters 
             (userId, filter_name, filter_description, criteria_type, filter_operator, filter_value,
              apply_to_portfolio, apply_to_trading, apply_to_watchlist)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             filter_data.filterName,
@@ -1403,7 +1405,7 @@ async def create_exclusion_filter(
         cursor.execute("""
             INSERT INTO ExclusionHistory 
             (userId, action_type, exclusion_type, target_identifier, target_name, action_reason)
-            VALUES (?, 'add', 'filter', ?, ?, ?)
+            VALUES (%s, 'add', 'filter', %s, %s, %s)
         """, (user_id, str(filter_id), filter_data.filterName, "Filter created"))
         
         conn.commit()
@@ -1441,7 +1443,7 @@ async def bulk_exclude_assets(
         # Create bulk operation record
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS BulkExclusionOperations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 operation_name TEXT NOT NULL,
                 operation_type TEXT NOT NULL,
@@ -1459,7 +1461,7 @@ async def bulk_exclude_assets(
         cursor.execute("""
             INSERT INTO BulkExclusionOperations 
             (userId, operation_name, operation_type, total_assets)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (user_id, bulk_operation.operationName, bulk_operation.operationType, len(bulk_operation.assetList)))
         
         operation_id = cursor.lastrowid
@@ -1472,11 +1474,11 @@ async def bulk_exclude_assets(
         for asset_symbol in bulk_operation.assetList:
             try:
                 cursor.execute("""
-                    INSERT OR REPLACE INTO IndividualAssetExclusions 
+                    INSERT INTO IndividualAssetExclusions 
                     (userId, asset_symbol, exclusion_reason, exclusion_category,
                      exclude_from_portfolio, exclude_from_trading, exclude_from_watchlist, exclude_from_suggestions,
                      is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
                 """, (
                     user_id,
                     asset_symbol,
@@ -1497,9 +1499,9 @@ async def bulk_exclude_assets(
         # Update operation status
         cursor.execute("""
             UPDATE BulkExclusionOperations 
-            SET processed_assets = ?, failed_assets = ?, success_list = ?, failure_list = ?,
+            SET processed_assets = %s, failed_assets = %s, success_list = %s, failure_list = %s,
                 status = 'completed', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = %s
         """, (
             len(success_list),
             len(failure_list), 
@@ -1549,7 +1551,7 @@ async def check_asset_exclusion(
         
         cursor.execute(f"""
             SELECT * FROM IndividualAssetExclusions 
-            WHERE userId = ? AND asset_symbol = ? AND is_active = TRUE
+            WHERE userId = %s AND asset_symbol = %s AND is_active = TRUE
             AND {scope_column} = TRUE
             AND (excluded_until IS NULL OR excluded_until > CURRENT_TIMESTAMP)
         """, (user_id, asset_symbol))
@@ -1601,7 +1603,7 @@ async def get_exclusion_impact_analysis(user_id: int = 1):
                 COUNT(CASE WHEN exclusion_category = 'risk' THEN 1 END) as risk_exclusions,
                 COUNT(CASE WHEN exclusion_category = 'ethics' THEN 1 END) as ethics_exclusions
             FROM IndividualAssetExclusions 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         stats = cursor.fetchone()
@@ -1614,7 +1616,7 @@ async def get_exclusion_impact_analysis(user_id: int = 1):
                 action_reason,
                 action_timestamp
             FROM ExclusionHistory 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY action_timestamp DESC 
             LIMIT 10
         """, (user_id,))
@@ -1676,7 +1678,7 @@ async def get_exclusion_settings(user_id: int = 1):
         # Create settings table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ExclusionSettings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 enable_automatic_exclusions BOOLEAN DEFAULT FALSE,
                 enable_temporary_exclusions BOOLEAN DEFAULT TRUE,
@@ -1699,7 +1701,7 @@ async def get_exclusion_settings(user_id: int = 1):
         """)
         
         cursor.execute("""
-            SELECT * FROM ExclusionSettings WHERE userId = ?
+            SELECT * FROM ExclusionSettings WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -1707,13 +1709,13 @@ async def get_exclusion_settings(user_id: int = 1):
         if not result:
             # Create default settings
             cursor.execute("""
-                INSERT INTO ExclusionSettings (userId) VALUES (?)
+                INSERT INTO ExclusionSettings (userId) VALUES (%s)
             """, (user_id,))
             conn.commit()
             
             # Fetch the default settings
             cursor.execute("""
-                SELECT * FROM ExclusionSettings WHERE userId = ?
+                SELECT * FROM ExclusionSettings WHERE userId = %s
             """, (user_id,))
             result = cursor.fetchone()
         
@@ -1756,22 +1758,22 @@ async def update_exclusion_settings(
         # Update settings
         cursor.execute("""
             UPDATE ExclusionSettings 
-            SET enable_automatic_exclusions = ?,
-                enable_temporary_exclusions = ?,
-                default_exclusion_duration = ?,
-                notify_on_exclusion_add = ?,
-                notify_on_exclusion_remove = ?,
-                default_portfolio_exclusion = ?,
-                default_trading_exclusion = ?,
-                default_watchlist_exclusion = ?,
-                default_suggestion_exclusion = ?,
-                auto_exclude_poor_performers = ?,
-                poor_performance_threshold = ?,
-                performance_evaluation_period = ?,
-                allow_bulk_operations = ?,
-                max_bulk_operation_size = ?,
+            SET enable_automatic_exclusions = %s,
+                enable_temporary_exclusions = %s,
+                default_exclusion_duration = %s,
+                notify_on_exclusion_add = %s,
+                notify_on_exclusion_remove = %s,
+                default_portfolio_exclusion = %s,
+                default_trading_exclusion = %s,
+                default_watchlist_exclusion = %s,
+                default_suggestion_exclusion = %s,
+                auto_exclude_poor_performers = %s,
+                poor_performance_threshold = %s,
+                performance_evaluation_period = %s,
+                allow_bulk_operations = %s,
+                max_bulk_operation_size = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             settings.get("enableAutomaticExclusions", False),
             settings.get("enableTemporaryExclusions", True),
@@ -1821,7 +1823,7 @@ async def export_exclusions(user_id: int = 1):
         # Get all exclusions
         cursor.execute("""
             SELECT * FROM IndividualAssetExclusions 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         exclusions = cursor.fetchall()
@@ -1830,7 +1832,7 @@ async def export_exclusions(user_id: int = 1):
         # Get all filters
         cursor.execute("""
             SELECT * FROM CriteriaExclusionFilters 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
         """, (user_id,))
         
         filters = cursor.fetchall()
@@ -1858,4 +1860,4 @@ async def export_exclusions(user_id: int = 1):
         return export_data
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))              

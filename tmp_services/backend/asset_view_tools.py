@@ -16,8 +16,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -121,8 +122,8 @@ class AssetViewFilter(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -133,7 +134,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_06",
@@ -163,7 +164,7 @@ async def get_asset_view_preferences(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetViewPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 default_view_type TEXT DEFAULT 'holdings',
                 columns_visible TEXT DEFAULT '["symbol", "name", "value", "change"]',
@@ -183,13 +184,13 @@ async def get_asset_view_preferences(user_id: int = 1):
         """)
         
         # Get preferences
-        cursor.execute("SELECT * FROM AssetViewPreferences WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT * FROM AssetViewPreferences WHERE userId = %s", (user_id,))
         result = cursor.fetchone()
         
         if not result:
             # Create default preferences
             cursor.execute("""
-                INSERT INTO AssetViewPreferences (userId) VALUES (?)
+                INSERT INTO AssetViewPreferences (userId) VALUES (%s)
             """, (user_id,))
             
             conn.commit()
@@ -243,19 +244,19 @@ async def update_asset_view_preferences(
         cursor.execute("""
             UPDATE AssetViewPreferences 
             SET 
-                default_view_type = ?,
-                columns_visible = ?,
-                sort_column = ?,
-                sort_direction = ?,
-                show_performance_tab = ?,
-                show_allocation_chart = ?,
-                refresh_interval = ?,
-                items_per_page = ?,
-                default_filters = ?,
-                chart_type = ?,
-                chart_theme = ?,
+                default_view_type = %s,
+                columns_visible = %s,
+                sort_column = %s,
+                sort_direction = %s,
+                show_performance_tab = %s,
+                show_allocation_chart = %s,
+                refresh_interval = %s,
+                items_per_page = %s,
+                default_filters = %s,
+                chart_type = %s,
+                chart_theme = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             preferences.defaultViewType,
             json.dumps(preferences.columnsVisible),
@@ -299,7 +300,7 @@ async def get_asset_tags(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 color TEXT NOT NULL DEFAULT '#3B82F6',
@@ -325,7 +326,7 @@ async def get_asset_tags(user_id: int = 1):
                 SELECT id, userId, tag_id FROM AssetTagAssignments 
                 WHERE is_active = TRUE
             ) a ON t.id = a.tag_id
-            WHERE t.userId = ? AND t.is_active = TRUE
+            WHERE t.userId = %s AND t.is_active = TRUE
             GROUP BY t.id
             ORDER BY actual_usage_count DESC, t.name
         """, (user_id,))
@@ -348,7 +349,7 @@ async def get_asset_tags(user_id: int = 1):
             for tag in demo_tags:
                 cursor.execute("""
                     INSERT INTO AssetTags (userId, name, color, description)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s)
                 """, (user_id, tag["name"], tag["color"], tag["description"]))
             
             conn.commit()
@@ -363,7 +364,7 @@ async def get_asset_tags(user_id: int = 1):
                     SELECT id, userId, tag_id FROM AssetTagAssignments 
                     WHERE is_active = TRUE
                 ) a ON t.id = a.tag_id
-                WHERE t.userId = ? AND t.is_active = TRUE
+                WHERE t.userId = %s AND t.is_active = TRUE
                 GROUP BY t.id
                 ORDER BY actual_usage_count DESC, t.name
             """, (user_id,))
@@ -421,7 +422,7 @@ async def create_asset_tag(
         # Create tag assignments table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTagAssignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 asset_symbol TEXT NOT NULL,
                 tag_id INTEGER NOT NULL REFERENCES AssetTags(id),
@@ -437,7 +438,7 @@ async def create_asset_tag(
         # Insert the tag
         cursor.execute("""
             INSERT INTO AssetTags (userId, name, color, description)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (
             user_id,
             tag["name"],
@@ -479,9 +480,9 @@ async def assign_asset_tag(
         
         # Insert the assignment
         cursor.execute("""
-            INSERT OR REPLACE INTO AssetTagAssignments 
+            INSERT INTO AssetTagAssignments 
             (userId, asset_symbol, tag_id, assigned_by, assignment_reason, confidence_score)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             assignment["assetSymbol"],
@@ -496,9 +497,9 @@ async def assign_asset_tag(
             UPDATE AssetTags 
             SET usage_count = (
                 SELECT COUNT(*) FROM AssetTagAssignments 
-                WHERE tag_id = ? AND is_active = TRUE
+                WHERE tag_id = %s AND is_active = TRUE
             )
-            WHERE id = ?
+            WHERE id = %s
         """, (assignment["tagId"], assignment["tagId"]))
         
         conn.commit()
@@ -542,7 +543,7 @@ async def get_asset_tags_for_symbol(
                 a.confidence_score
             FROM AssetTags t
             INNER JOIN AssetTagAssignments a ON t.id = a.tag_id
-            WHERE t.userId = ? AND a.asset_symbol = ? AND a.is_active = TRUE
+            WHERE t.userId = %s AND a.asset_symbol = %s AND a.is_active = TRUE
             ORDER BY a.assigned_at DESC
         """, (user_id, asset_symbol))
         
@@ -589,7 +590,7 @@ async def get_allocation_rings(user_id: int = 1):
         # Create allocation rings table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetAllocationRings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 description TEXT,
@@ -609,7 +610,7 @@ async def get_allocation_rings(user_id: int = 1):
         
         cursor.execute("""
             SELECT * FROM AssetAllocationRings 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
             ORDER BY is_default DESC, name
         """, (user_id,))
         
@@ -620,7 +621,7 @@ async def get_allocation_rings(user_id: int = 1):
             cursor.execute("""
                 INSERT INTO AssetAllocationRings 
                 (userId, name, description, is_default)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
             """, (
                 user_id,
                 "Default Portfolio",
@@ -633,7 +634,7 @@ async def get_allocation_rings(user_id: int = 1):
             # Re-fetch
             cursor.execute("""
                 SELECT * FROM AssetAllocationRings 
-                WHERE userId = ? AND is_active = TRUE
+                WHERE userId = %s AND is_active = TRUE
                 ORDER BY is_default DESC, name
             """, (user_id,))
             
@@ -692,7 +693,7 @@ async def create_allocation_ring(
         # Create asset class allocations table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetClassAllocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 ring_id INTEGER NOT NULL REFERENCES AssetAllocationRings(id),
                 asset_class TEXT NOT NULL,
@@ -719,7 +720,7 @@ async def create_allocation_ring(
             INSERT INTO AssetAllocationRings 
             (userId, name, description, ring_type, inner_radius, outer_radius, 
              colors, total_target_percentage, rebalance_threshold)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             ring["name"],
@@ -766,7 +767,7 @@ async def get_ring_allocations(
         
         cursor.execute("""
             SELECT * FROM AssetClassAllocations
-            WHERE userId = ? AND ring_id = ?
+            WHERE userId = %s AND ring_id = %s
             ORDER BY sort_order, asset_class
         """, (user_id, ring_id))
         
@@ -786,7 +787,7 @@ async def get_ring_allocations(
                 cursor.execute("""
                     INSERT INTO AssetClassAllocations 
                     (userId, ring_id, asset_class, target_percentage, color, sort_order)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, ring_id, allocation["asset_class"], 
                     allocation["target_percentage"], allocation["color"], i
@@ -797,7 +798,7 @@ async def get_ring_allocations(
             # Re-fetch
             cursor.execute("""
                 SELECT * FROM AssetClassAllocations
-                WHERE userId = ? AND ring_id = ?
+                WHERE userId = %s AND ring_id = %s
                 ORDER BY sort_order, asset_class
             """, (user_id, ring_id))
             
@@ -858,7 +859,7 @@ async def log_asset_view_history(
         # Create view history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetViewHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 view_type TEXT NOT NULL,
                 view_config TEXT,
@@ -874,7 +875,7 @@ async def log_asset_view_history(
         cursor.execute("""
             INSERT INTO AssetViewHistory 
             (userId, view_type, view_config, asset_symbol, filters_applied, session_id, view_duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             view_data["viewType"],
@@ -912,8 +913,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -1017,8 +1019,8 @@ class AssetViewFilter(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -1029,7 +1031,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_06",
@@ -1059,7 +1061,7 @@ async def get_asset_view_preferences(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetViewPreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 default_view_type TEXT DEFAULT 'holdings',
                 columns_visible TEXT DEFAULT '["symbol", "name", "value", "change"]',
@@ -1079,13 +1081,13 @@ async def get_asset_view_preferences(user_id: int = 1):
         """)
         
         # Get preferences
-        cursor.execute("SELECT * FROM AssetViewPreferences WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT * FROM AssetViewPreferences WHERE userId = %s", (user_id,))
         result = cursor.fetchone()
         
         if not result:
             # Create default preferences
             cursor.execute("""
-                INSERT INTO AssetViewPreferences (userId) VALUES (?)
+                INSERT INTO AssetViewPreferences (userId) VALUES (%s)
             """, (user_id,))
             
             conn.commit()
@@ -1139,19 +1141,19 @@ async def update_asset_view_preferences(
         cursor.execute("""
             UPDATE AssetViewPreferences 
             SET 
-                default_view_type = ?,
-                columns_visible = ?,
-                sort_column = ?,
-                sort_direction = ?,
-                show_performance_tab = ?,
-                show_allocation_chart = ?,
-                refresh_interval = ?,
-                items_per_page = ?,
-                default_filters = ?,
-                chart_type = ?,
-                chart_theme = ?,
+                default_view_type = %s,
+                columns_visible = %s,
+                sort_column = %s,
+                sort_direction = %s,
+                show_performance_tab = %s,
+                show_allocation_chart = %s,
+                refresh_interval = %s,
+                items_per_page = %s,
+                default_filters = %s,
+                chart_type = %s,
+                chart_theme = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE userId = ?
+            WHERE userId = %s
         """, (
             preferences.defaultViewType,
             json.dumps(preferences.columnsVisible),
@@ -1195,7 +1197,7 @@ async def get_asset_tags(user_id: int = 1):
         # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 color TEXT NOT NULL DEFAULT '#3B82F6',
@@ -1221,7 +1223,7 @@ async def get_asset_tags(user_id: int = 1):
                 SELECT id, userId, tag_id FROM AssetTagAssignments 
                 WHERE is_active = TRUE
             ) a ON t.id = a.tag_id
-            WHERE t.userId = ? AND t.is_active = TRUE
+            WHERE t.userId = %s AND t.is_active = TRUE
             GROUP BY t.id
             ORDER BY actual_usage_count DESC, t.name
         """, (user_id,))
@@ -1244,7 +1246,7 @@ async def get_asset_tags(user_id: int = 1):
             for tag in demo_tags:
                 cursor.execute("""
                     INSERT INTO AssetTags (userId, name, color, description)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s)
                 """, (user_id, tag["name"], tag["color"], tag["description"]))
             
             conn.commit()
@@ -1259,7 +1261,7 @@ async def get_asset_tags(user_id: int = 1):
                     SELECT id, userId, tag_id FROM AssetTagAssignments 
                     WHERE is_active = TRUE
                 ) a ON t.id = a.tag_id
-                WHERE t.userId = ? AND t.is_active = TRUE
+                WHERE t.userId = %s AND t.is_active = TRUE
                 GROUP BY t.id
                 ORDER BY actual_usage_count DESC, t.name
             """, (user_id,))
@@ -1317,7 +1319,7 @@ async def create_asset_tag(
         # Create tag assignments table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetTagAssignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 asset_symbol TEXT NOT NULL,
                 tag_id INTEGER NOT NULL REFERENCES AssetTags(id),
@@ -1333,7 +1335,7 @@ async def create_asset_tag(
         # Insert the tag
         cursor.execute("""
             INSERT INTO AssetTags (userId, name, color, description)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (
             user_id,
             tag["name"],
@@ -1375,9 +1377,9 @@ async def assign_asset_tag(
         
         # Insert the assignment
         cursor.execute("""
-            INSERT OR REPLACE INTO AssetTagAssignments 
+            INSERT INTO AssetTagAssignments 
             (userId, asset_symbol, tag_id, assigned_by, assignment_reason, confidence_score)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             assignment["assetSymbol"],
@@ -1392,9 +1394,9 @@ async def assign_asset_tag(
             UPDATE AssetTags 
             SET usage_count = (
                 SELECT COUNT(*) FROM AssetTagAssignments 
-                WHERE tag_id = ? AND is_active = TRUE
+                WHERE tag_id = %s AND is_active = TRUE
             )
-            WHERE id = ?
+            WHERE id = %s
         """, (assignment["tagId"], assignment["tagId"]))
         
         conn.commit()
@@ -1438,7 +1440,7 @@ async def get_asset_tags_for_symbol(
                 a.confidence_score
             FROM AssetTags t
             INNER JOIN AssetTagAssignments a ON t.id = a.tag_id
-            WHERE t.userId = ? AND a.asset_symbol = ? AND a.is_active = TRUE
+            WHERE t.userId = %s AND a.asset_symbol = %s AND a.is_active = TRUE
             ORDER BY a.assigned_at DESC
         """, (user_id, asset_symbol))
         
@@ -1485,7 +1487,7 @@ async def get_allocation_rings(user_id: int = 1):
         # Create allocation rings table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetAllocationRings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 description TEXT,
@@ -1505,7 +1507,7 @@ async def get_allocation_rings(user_id: int = 1):
         
         cursor.execute("""
             SELECT * FROM AssetAllocationRings 
-            WHERE userId = ? AND is_active = TRUE
+            WHERE userId = %s AND is_active = TRUE
             ORDER BY is_default DESC, name
         """, (user_id,))
         
@@ -1516,7 +1518,7 @@ async def get_allocation_rings(user_id: int = 1):
             cursor.execute("""
                 INSERT INTO AssetAllocationRings 
                 (userId, name, description, is_default)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
             """, (
                 user_id,
                 "Default Portfolio",
@@ -1529,7 +1531,7 @@ async def get_allocation_rings(user_id: int = 1):
             # Re-fetch
             cursor.execute("""
                 SELECT * FROM AssetAllocationRings 
-                WHERE userId = ? AND is_active = TRUE
+                WHERE userId = %s AND is_active = TRUE
                 ORDER BY is_default DESC, name
             """, (user_id,))
             
@@ -1588,7 +1590,7 @@ async def create_allocation_ring(
         # Create asset class allocations table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetClassAllocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 ring_id INTEGER NOT NULL REFERENCES AssetAllocationRings(id),
                 asset_class TEXT NOT NULL,
@@ -1615,7 +1617,7 @@ async def create_allocation_ring(
             INSERT INTO AssetAllocationRings 
             (userId, name, description, ring_type, inner_radius, outer_radius, 
              colors, total_target_percentage, rebalance_threshold)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             ring["name"],
@@ -1662,7 +1664,7 @@ async def get_ring_allocations(
         
         cursor.execute("""
             SELECT * FROM AssetClassAllocations
-            WHERE userId = ? AND ring_id = ?
+            WHERE userId = %s AND ring_id = %s
             ORDER BY sort_order, asset_class
         """, (user_id, ring_id))
         
@@ -1682,7 +1684,7 @@ async def get_ring_allocations(
                 cursor.execute("""
                     INSERT INTO AssetClassAllocations 
                     (userId, ring_id, asset_class, target_percentage, color, sort_order)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, ring_id, allocation["asset_class"], 
                     allocation["target_percentage"], allocation["color"], i
@@ -1693,7 +1695,7 @@ async def get_ring_allocations(
             # Re-fetch
             cursor.execute("""
                 SELECT * FROM AssetClassAllocations
-                WHERE userId = ? AND ring_id = ?
+                WHERE userId = %s AND ring_id = %s
                 ORDER BY sort_order, asset_class
             """, (user_id, ring_id))
             
@@ -1754,7 +1756,7 @@ async def log_asset_view_history(
         # Create view history table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetViewHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 view_type TEXT NOT NULL,
                 view_config TEXT,
@@ -1770,7 +1772,7 @@ async def log_asset_view_history(
         cursor.execute("""
             INSERT INTO AssetViewHistory 
             (userId, view_type, view_config, asset_symbol, filters_applied, session_id, view_duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             view_data["viewType"],
@@ -1790,4 +1792,4 @@ async def log_asset_view_history(
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))          

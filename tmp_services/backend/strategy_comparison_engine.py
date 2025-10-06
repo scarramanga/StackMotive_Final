@@ -5,8 +5,9 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -16,8 +17,8 @@ class StrategyComparison(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 @router.post("/strategy-comparison-engine/compare")
 async def compare_strategies(comparison: StrategyComparison = Body(...), user_id: int = 1):
@@ -28,7 +29,7 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyComparisons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 strategy_id TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
@@ -47,7 +48,7 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
         """)
         
         # Check if we have comparison data
-        cursor.execute("SELECT COUNT(*) FROM StrategyComparisons WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT COUNT(*) FROM StrategyComparisons WHERE userId = %s", (user_id,))
         count = cursor.fetchone()[0]
         
         if count == 0:
@@ -63,7 +64,7 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
                     INSERT INTO StrategyComparisons 
                     (userId, strategy_id, strategy_name, total_return, annual_return, volatility,
                      sharpe_ratio, max_drawdown, win_rate, profit_factor)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, data["strategy_id"], data["strategy_name"], data["total_return"],
                     data["annual_return"], data["volatility"], data["sharpe_ratio"],
@@ -74,14 +75,14 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
         
         # Get comparison data for requested strategies
         if comparison.strategyIds:
-            placeholders = ','.join(['?' for _ in comparison.strategyIds])
+            placeholders = ','.join(['%s' for _ in comparison.strategyIds])
             cursor.execute(f"""
                 SELECT * FROM StrategyComparisons 
-                WHERE userId = ? AND strategy_id IN ({placeholders})
+                WHERE userId = %s AND strategy_id IN ({placeholders})
             """, [user_id] + comparison.strategyIds)
         else:
             cursor.execute("""
-                SELECT * FROM StrategyComparisons WHERE userId = ?
+                SELECT * FROM StrategyComparisons WHERE userId = %s
             """, (user_id,))
         
         results = cursor.fetchall()
@@ -120,7 +121,7 @@ async def get_comparison_matrix(user_id: int = 1):
                 max_drawdown,
                 win_rate
             FROM StrategyComparisons 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY total_return DESC
         """, (user_id,))
         
@@ -140,8 +141,9 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path as FilePath
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -151,8 +153,8 @@ class StrategyComparison(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = FilePath(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 @router.post("/strategy-comparison-engine/compare")
 async def compare_strategies(comparison: StrategyComparison = Body(...), user_id: int = 1):
@@ -163,7 +165,7 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS StrategyComparisons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 strategy_id TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
@@ -182,7 +184,7 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
         """)
         
         # Check if we have comparison data
-        cursor.execute("SELECT COUNT(*) FROM StrategyComparisons WHERE userId = ?", (user_id,))
+        cursor.execute("SELECT COUNT(*) FROM StrategyComparisons WHERE userId = %s", (user_id,))
         count = cursor.fetchone()[0]
         
         if count == 0:
@@ -198,7 +200,7 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
                     INSERT INTO StrategyComparisons 
                     (userId, strategy_id, strategy_name, total_return, annual_return, volatility,
                      sharpe_ratio, max_drawdown, win_rate, profit_factor)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id, data["strategy_id"], data["strategy_name"], data["total_return"],
                     data["annual_return"], data["volatility"], data["sharpe_ratio"],
@@ -209,14 +211,14 @@ async def compare_strategies(comparison: StrategyComparison = Body(...), user_id
         
         # Get comparison data for requested strategies
         if comparison.strategyIds:
-            placeholders = ','.join(['?' for _ in comparison.strategyIds])
+            placeholders = ','.join(['%s' for _ in comparison.strategyIds])
             cursor.execute(f"""
                 SELECT * FROM StrategyComparisons 
-                WHERE userId = ? AND strategy_id IN ({placeholders})
+                WHERE userId = %s AND strategy_id IN ({placeholders})
             """, [user_id] + comparison.strategyIds)
         else:
             cursor.execute("""
-                SELECT * FROM StrategyComparisons WHERE userId = ?
+                SELECT * FROM StrategyComparisons WHERE userId = %s
             """, (user_id,))
         
         results = cursor.fetchall()
@@ -255,7 +257,7 @@ async def get_comparison_matrix(user_id: int = 1):
                 max_drawdown,
                 win_rate
             FROM StrategyComparisons 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY total_return DESC
         """, (user_id,))
         
@@ -268,4 +270,4 @@ async def get_comparison_matrix(user_id: int = 1):
         return {"matrix": matrix, "totalStrategies": len(matrix)}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))        

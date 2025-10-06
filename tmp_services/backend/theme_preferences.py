@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, Dict, Any
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -49,8 +50,8 @@ class ThemePreferencesResponse(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -61,7 +62,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_20",
@@ -90,7 +91,7 @@ async def get_theme_preferences(user_id: int):
         # Create theme preferences table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserThemePreferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 theme_mode TEXT NOT NULL DEFAULT 'light',
                 accent_color TEXT NOT NULL DEFAULT '#3B82F6',
@@ -108,7 +109,7 @@ async def get_theme_preferences(user_id: int):
         
         # Get user preferences
         cursor.execute("""
-            SELECT * FROM UserThemePreferences WHERE userId = ?
+            SELECT * FROM UserThemePreferences WHERE userId = %s
         """, (user_id,))
         
         result = cursor.fetchone()
@@ -120,7 +121,7 @@ async def get_theme_preferences(user_id: int):
                 INSERT INTO UserThemePreferences 
                 (userId, theme_mode, accent_color, font_size, high_contrast, 
                  reduce_motion, compact_mode, sidebar_collapsed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 default_preferences.theme_mode,
@@ -136,7 +137,7 @@ async def get_theme_preferences(user_id: int):
             
             # Fetch the created preferences
             cursor.execute("""
-                SELECT * FROM UserThemePreferences WHERE userId = ?
+                SELECT * FROM UserThemePreferences WHERE userId = %s
             """, (user_id,))
             result = cursor.fetchone()
         
@@ -186,10 +187,10 @@ async def update_theme_preferences(user_id: int, preferences: ThemePreferences):
         # Update preferences
         cursor.execute("""
             UPDATE UserThemePreferences 
-            SET theme_mode = ?, accent_color = ?, font_size = ?, 
-                high_contrast = ?, reduce_motion = ?, compact_mode = ?, 
-                sidebar_collapsed = ?, updated_at = ?
-            WHERE userId = ?
+            SET theme_mode = %s, accent_color = %s, font_size = %s, 
+                high_contrast = %s, reduce_motion = %s, compact_mode = %s, 
+                sidebar_collapsed = %s, updated_at = %s
+            WHERE userId = %s
         """, (
             preferences.theme_mode,
             preferences.accent_color,
@@ -208,7 +209,7 @@ async def update_theme_preferences(user_id: int, preferences: ThemePreferences):
                 INSERT INTO UserThemePreferences 
                 (userId, theme_mode, accent_color, font_size, high_contrast, 
                  reduce_motion, compact_mode, sidebar_collapsed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 preferences.theme_mode,
@@ -255,7 +256,7 @@ async def sync_theme_preferences(user_id: int, sync_request: ThemeSyncRequest):
         # Create theme sync history table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ThemeSyncHistory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 device_id TEXT,
                 theme_data TEXT NOT NULL,
@@ -271,7 +272,7 @@ async def sync_theme_preferences(user_id: int, sync_request: ThemeSyncRequest):
         # Log sync history
         cursor.execute("""
             INSERT INTO ThemeSyncHistory (userId, device_id, theme_data, sync_source)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (
             user_id,
             sync_request.device_id,
@@ -313,9 +314,9 @@ async def get_theme_sync_history(user_id: int, limit: int = 10):
         
         cursor.execute("""
             SELECT * FROM ThemeSyncHistory 
-            WHERE userId = ? 
+            WHERE userId = %s 
             ORDER BY sync_timestamp DESC 
-            LIMIT ?
+            LIMIT %s
         """, (user_id, limit))
         
         columns = [description[0] for description in cursor.description]
@@ -362,4 +363,4 @@ async def reset_theme_preferences(user_id: int):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            

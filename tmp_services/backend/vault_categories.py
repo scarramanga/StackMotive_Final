@@ -3,8 +3,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 from decimal import Decimal
 
 router = APIRouter()
@@ -62,8 +63,8 @@ class AllocationSnapshot(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -74,7 +75,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_53",
@@ -103,7 +104,7 @@ async def get_vault_categories(user_id: int, category_type: Optional[str] = Quer
         # Create vault categories table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS VaultCategories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 category_name TEXT NOT NULL,
                 category_code TEXT NOT NULL,
@@ -131,11 +132,11 @@ async def get_vault_categories(user_id: int, category_type: Optional[str] = Quer
         """)
         
         # Build query with filters
-        query = "SELECT * FROM VaultCategories WHERE userId = ?"
+        query = "SELECT * FROM VaultCategories WHERE userId = %s"
         params = [user_id]
         
         if category_type:
-            query += " AND category_type = ?"
+            query += " AND category_type = %s"
             params.append(category_type)
         
         if active_only:
@@ -231,7 +232,7 @@ async def create_default_categories(user_id: int):
                 INSERT OR IGNORE INTO VaultCategories 
                 (userId, category_name, category_code, category_type, target_allocation_percent, 
                  category_color, display_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id, cat["name"], cat["code"], cat["type"], 
                 cat["target"], cat["color"], cat["order"]
@@ -258,7 +259,7 @@ async def create_vault_category(user_id: int, category: VaultCategory):
              auto_rebalance_enabled, risk_level, max_single_position_percent,
              volatility_limit, tax_efficiency_priority, tax_loss_harvesting_enabled,
              is_active, display_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             category.category_name,
@@ -320,16 +321,16 @@ async def update_vault_category(user_id: int, category_id: int, category: VaultC
         
         cursor.execute("""
             UPDATE VaultCategories 
-            SET category_name = ?, category_code = ?, category_type = ?, 
-                category_description = ?, category_color = ?, category_icon = ?,
-                target_allocation_percent = ?, min_allocation_percent = ?,
-                max_allocation_percent = ?, rebalance_threshold = ?,
-                rebalance_frequency = ?, auto_rebalance_enabled = ?,
-                risk_level = ?, max_single_position_percent = ?,
-                volatility_limit = ?, tax_efficiency_priority = ?,
-                tax_loss_harvesting_enabled = ?, is_active = ?,
-                display_order = ?, updated_at = ?
-            WHERE id = ? AND userId = ?
+            SET category_name = %s, category_code = %s, category_type = %s, 
+                category_description = %s, category_color = %s, category_icon = %s,
+                target_allocation_percent = %s, min_allocation_percent = %s,
+                max_allocation_percent = %s, rebalance_threshold = %s,
+                rebalance_frequency = %s, auto_rebalance_enabled = %s,
+                risk_level = %s, max_single_position_percent = %s,
+                volatility_limit = %s, tax_efficiency_priority = %s,
+                tax_loss_harvesting_enabled = %s, is_active = %s,
+                display_order = %s, updated_at = %s
+            WHERE id = %s AND userId = %s
         """, (
             category.category_name,
             category.category_code,
@@ -392,7 +393,7 @@ async def assign_asset_to_category(user_id: int, assignment: AssetCategoryAssign
         # Create asset assignments table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetCategoryAssignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 categoryId INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
@@ -418,7 +419,7 @@ async def assign_asset_to_category(user_id: int, assignment: AssetCategoryAssign
             (userId, categoryId, symbol, asset_name, asset_class, sector, market,
              assignment_type, assignment_rule, assignment_confidence, 
              target_weight_in_category, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             int(assignment.category_id),
@@ -480,16 +481,16 @@ async def get_asset_assignments(
             SELECT a.*, c.category_name, c.category_type, c.category_color
             FROM AssetCategoryAssignments a
             LEFT JOIN VaultCategories c ON a.categoryId = c.id
-            WHERE a.userId = ?
+            WHERE a.userId = %s
         """
         params = [user_id]
         
         if category_id:
-            query += " AND a.categoryId = ?"
+            query += " AND a.categoryId = %s"
             params.append(category_id)
         
         if symbol:
-            query += " AND a.symbol = ?"
+            query += " AND a.symbol = %s"
             params.append(symbol)
         
         if active_only:
@@ -544,10 +545,10 @@ async def auto_assign_assets(user_id: int, assets: List[Dict[str, Any]]):
             cursor.execute("""
                 SELECT id, category_name, category_type
                 FROM VaultCategories
-                WHERE userId = ? AND is_active = 1
+                WHERE userId = %s AND is_active = 1
                 AND (
-                    (category_type = 'asset_class' AND UPPER(category_name) LIKE '%' || UPPER(?) || '%') OR
-                    (category_type = 'sector' AND UPPER(category_name) LIKE '%' || UPPER(?) || '%')
+                    (category_type = 'asset_class' AND UPPER(category_name) LIKE '%' || UPPER(%s) || '%') OR
+                    (category_type = 'sector' AND UPPER(category_name) LIKE '%' || UPPER(%s) || '%')
                 )
                 ORDER BY 
                     CASE 
@@ -569,7 +570,7 @@ async def auto_assign_assets(user_id: int, assets: List[Dict[str, Any]]):
                         INSERT OR IGNORE INTO AssetCategoryAssignments 
                         (userId, categoryId, symbol, asset_class, sector, 
                          assignment_type, assignment_confidence)
-                        VALUES (?, ?, ?, ?, ?, 'automatic', 0.8)
+                        VALUES (%s, %s, %s, %s, %s, 'automatic', 0.8)
                     """, (user_id, category_id, symbol, asset_class, sector))
                     
                     if cursor.rowcount > 0:
@@ -633,7 +634,7 @@ async def get_allocation_summary(user_id: int):
                 SUM(a.target_weight_in_category) as total_target_weight
             FROM VaultCategories c
             LEFT JOIN AssetCategoryAssignments a ON c.id = a.categoryId AND a.is_active = 1
-            WHERE c.userId = ? AND c.is_active = 1
+            WHERE c.userId = %s AND c.is_active = 1
             GROUP BY c.id, c.category_name, c.category_type, c.category_color,
                      c.target_allocation_percent, c.min_allocation_percent, c.max_allocation_percent
             ORDER BY c.display_order, c.category_name
@@ -675,8 +676,9 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime, timedelta
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 from decimal import Decimal
 
 router = APIRouter()
@@ -734,8 +736,8 @@ class AllocationSnapshot(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -746,7 +748,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_53",
@@ -775,7 +777,7 @@ async def get_vault_categories(user_id: int, category_type: Optional[str] = Quer
         # Create vault categories table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS VaultCategories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 category_name TEXT NOT NULL,
                 category_code TEXT NOT NULL,
@@ -803,11 +805,11 @@ async def get_vault_categories(user_id: int, category_type: Optional[str] = Quer
         """)
         
         # Build query with filters
-        query = "SELECT * FROM VaultCategories WHERE userId = ?"
+        query = "SELECT * FROM VaultCategories WHERE userId = %s"
         params = [user_id]
         
         if category_type:
-            query += " AND category_type = ?"
+            query += " AND category_type = %s"
             params.append(category_type)
         
         if active_only:
@@ -903,7 +905,7 @@ async def create_default_categories(user_id: int):
                 INSERT OR IGNORE INTO VaultCategories 
                 (userId, category_name, category_code, category_type, target_allocation_percent, 
                  category_color, display_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id, cat["name"], cat["code"], cat["type"], 
                 cat["target"], cat["color"], cat["order"]
@@ -930,7 +932,7 @@ async def create_vault_category(user_id: int, category: VaultCategory):
              auto_rebalance_enabled, risk_level, max_single_position_percent,
              volatility_limit, tax_efficiency_priority, tax_loss_harvesting_enabled,
              is_active, display_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             category.category_name,
@@ -992,16 +994,16 @@ async def update_vault_category(user_id: int, category_id: int, category: VaultC
         
         cursor.execute("""
             UPDATE VaultCategories 
-            SET category_name = ?, category_code = ?, category_type = ?, 
-                category_description = ?, category_color = ?, category_icon = ?,
-                target_allocation_percent = ?, min_allocation_percent = ?,
-                max_allocation_percent = ?, rebalance_threshold = ?,
-                rebalance_frequency = ?, auto_rebalance_enabled = ?,
-                risk_level = ?, max_single_position_percent = ?,
-                volatility_limit = ?, tax_efficiency_priority = ?,
-                tax_loss_harvesting_enabled = ?, is_active = ?,
-                display_order = ?, updated_at = ?
-            WHERE id = ? AND userId = ?
+            SET category_name = %s, category_code = %s, category_type = %s, 
+                category_description = %s, category_color = %s, category_icon = %s,
+                target_allocation_percent = %s, min_allocation_percent = %s,
+                max_allocation_percent = %s, rebalance_threshold = %s,
+                rebalance_frequency = %s, auto_rebalance_enabled = %s,
+                risk_level = %s, max_single_position_percent = %s,
+                volatility_limit = %s, tax_efficiency_priority = %s,
+                tax_loss_harvesting_enabled = %s, is_active = %s,
+                display_order = %s, updated_at = %s
+            WHERE id = %s AND userId = %s
         """, (
             category.category_name,
             category.category_code,
@@ -1064,7 +1066,7 @@ async def assign_asset_to_category(user_id: int, assignment: AssetCategoryAssign
         # Create asset assignments table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS AssetCategoryAssignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 categoryId INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
@@ -1090,7 +1092,7 @@ async def assign_asset_to_category(user_id: int, assignment: AssetCategoryAssign
             (userId, categoryId, symbol, asset_name, asset_class, sector, market,
              assignment_type, assignment_rule, assignment_confidence, 
              target_weight_in_category, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             int(assignment.category_id),
@@ -1152,16 +1154,16 @@ async def get_asset_assignments(
             SELECT a.*, c.category_name, c.category_type, c.category_color
             FROM AssetCategoryAssignments a
             LEFT JOIN VaultCategories c ON a.categoryId = c.id
-            WHERE a.userId = ?
+            WHERE a.userId = %s
         """
         params = [user_id]
         
         if category_id:
-            query += " AND a.categoryId = ?"
+            query += " AND a.categoryId = %s"
             params.append(category_id)
         
         if symbol:
-            query += " AND a.symbol = ?"
+            query += " AND a.symbol = %s"
             params.append(symbol)
         
         if active_only:
@@ -1216,10 +1218,10 @@ async def auto_assign_assets(user_id: int, assets: List[Dict[str, Any]]):
             cursor.execute("""
                 SELECT id, category_name, category_type
                 FROM VaultCategories
-                WHERE userId = ? AND is_active = 1
+                WHERE userId = %s AND is_active = 1
                 AND (
-                    (category_type = 'asset_class' AND UPPER(category_name) LIKE '%' || UPPER(?) || '%') OR
-                    (category_type = 'sector' AND UPPER(category_name) LIKE '%' || UPPER(?) || '%')
+                    (category_type = 'asset_class' AND UPPER(category_name) LIKE '%' || UPPER(%s) || '%') OR
+                    (category_type = 'sector' AND UPPER(category_name) LIKE '%' || UPPER(%s) || '%')
                 )
                 ORDER BY 
                     CASE 
@@ -1241,7 +1243,7 @@ async def auto_assign_assets(user_id: int, assets: List[Dict[str, Any]]):
                         INSERT OR IGNORE INTO AssetCategoryAssignments 
                         (userId, categoryId, symbol, asset_class, sector, 
                          assignment_type, assignment_confidence)
-                        VALUES (?, ?, ?, ?, ?, 'automatic', 0.8)
+                        VALUES (%s, %s, %s, %s, %s, 'automatic', 0.8)
                     """, (user_id, category_id, symbol, asset_class, sector))
                     
                     if cursor.rowcount > 0:
@@ -1305,7 +1307,7 @@ async def get_allocation_summary(user_id: int):
                 SUM(a.target_weight_in_category) as total_target_weight
             FROM VaultCategories c
             LEFT JOIN AssetCategoryAssignments a ON c.id = a.categoryId AND a.is_active = 1
-            WHERE c.userId = ? AND c.is_active = 1
+            WHERE c.userId = %s AND c.is_active = 1
             GROUP BY c.id, c.category_name, c.category_type, c.category_color,
                      c.target_allocation_percent, c.min_allocation_percent, c.max_allocation_percent
             ORDER BY c.display_order, c.category_name
@@ -1342,4 +1344,4 @@ async def get_allocation_summary(user_id: int):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))                

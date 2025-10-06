@@ -3,8 +3,9 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import json
 from datetime import datetime
-import sqlite3
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
 router = APIRouter()
 
@@ -26,8 +27,8 @@ class HoldingFilter(BaseModel):
 
 # Database connection
 def get_db_connection():
-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
-    return sqlite3.connect(str(db_path))
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
+    return psycopg2.connect(database_url)
 
 # Agent Memory logging
 async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
@@ -38,7 +39,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
         cursor.execute("""
             INSERT INTO AgentMemory 
             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             "block_7",
@@ -67,7 +68,7 @@ async def get_all_holdings(user_id: int, filter_params: Optional[HoldingFilter] 
         # Create HoldingTags table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS HoldingTag (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 userId INTEGER NOT NULL,
                 positionId INTEGER NOT NULL,
                 tag TEXT NOT NULL,
@@ -88,7 +89,7 @@ async def get_all_holdings(user_id: int, filter_params: Optional[HoldingFilter] 
                 GROUP_CONCAT(ht.tag) as tags
             FROM PortfolioPosition pp
             LEFT JOIN HoldingTag ht ON pp.id = ht.positionId
-            WHERE pp.userId = ?
+            WHERE pp.userId = %s
         """
         
         params = [user_id]
@@ -96,15 +97,15 @@ async def get_all_holdings(user_id: int, filter_params: Optional[HoldingFilter] 
         # Add filters if provided
         if filter_params:
             if filter_params.assetClass:
-                base_query += " AND pp.assetClass = ?"
+                base_query += " AND pp.assetClass = %s"
                 params.append(filter_params.assetClass)
             
             if filter_params.minValue:
-                base_query += " AND (pp.quantity * pp.currentPrice) >= ?"
+                base_query += " AND (pp.quantity * pp.currentPrice) >= %s"
                 params.append(filter_params.minValue)
             
             if filter_params.maxValue:
-                base_query += " AND (pp.quantity * pp.currentPrice) <= ?"
+                base_query += " AND (pp.quantity * pp.currentPrice) <= %s"
                 params.append(filter_params.maxValue)
         
         base_query += " GROUP BY pp.id"
@@ -193,7 +194,7 @@ async def add_holding_tag(tag_data: HoldingTag):
         # Check if position exists and belongs to user
         cursor.execute("""
             SELECT symbol, name FROM PortfolioPosition 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (tag_data.positionId, tag_data.userId))
         
         position = cursor.fetchone()
@@ -202,8 +203,9 @@ async def add_holding_tag(tag_data: HoldingTag):
         
         # Add tag (ignore if already exists due to UNIQUE constraint)
         cursor.execute("""
-            INSERT OR IGNORE INTO HoldingTag (userId, positionId, tag)
-            VALUES (?, ?, ?)
+            INSERT INTO HoldingTag (userId, positionId, tag)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (userId, positionId, tag) DO NOTHING
         """, (tag_data.userId, tag_data.positionId, tag_data.tag))
         
         conn.commit()
@@ -239,7 +241,7 @@ async def remove_holding_tag(user_id: int, position_id: int, tag: str):
         # Get position info for logging
         cursor.execute("""
             SELECT symbol FROM PortfolioPosition 
-            WHERE id = ? AND userId = ?
+            WHERE id = %s AND userId = %s
         """, (position_id, user_id))
         
         position = cursor.fetchone()
@@ -249,7 +251,7 @@ async def remove_holding_tag(user_id: int, position_id: int, tag: str):
         # Remove tag
         cursor.execute("""
             DELETE FROM HoldingTag 
-            WHERE userId = ? AND positionId = ? AND tag = ?
+            WHERE userId = %s AND positionId = %s AND tag = %s
         """, (user_id, position_id, tag))
         
         if cursor.rowcount == 0:
@@ -288,7 +290,7 @@ async def get_available_tags(user_id: int):
         cursor.execute("""
             SELECT DISTINCT tag, COUNT(*) as usage_count
             FROM HoldingTag 
-            WHERE userId = ?
+            WHERE userId = %s
             GROUP BY tag
             ORDER BY usage_count DESC, tag ASC
         """, (user_id,))
@@ -317,7 +319,7 @@ async def get_holdings_analytics(user_id: int):
                 SUM(quantity * currentPrice) as totalValue,
                 AVG((currentPrice - avgPrice) / avgPrice * 100) as avgPnLPercentage
             FROM PortfolioPosition 
-            WHERE userId = ?
+            WHERE userId = %s
             GROUP BY assetClass
             ORDER BY totalValue DESC
         """, (user_id,))
@@ -339,7 +341,7 @@ async def get_holdings_analytics(user_id: int):
                 ((currentPrice - avgPrice) / avgPrice * 100) as pnlPercentage,
                 (quantity * (currentPrice - avgPrice)) as pnlAmount
             FROM PortfolioPosition 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY pnlPercentage DESC
             LIMIT 5
         """, (user_id,))
@@ -361,7 +363,7 @@ async def get_holdings_analytics(user_id: int):
                 ((currentPrice - avgPrice) / avgPrice * 100) as pnlPercentage,
                 (quantity * (currentPrice - avgPrice)) as pnlAmount
             FROM PortfolioPosition 
-            WHERE userId = ?
+            WHERE userId = %s
             ORDER BY pnlPercentage ASC
             LIMIT 5
         """, (user_id,))
@@ -386,7 +388,7 @@ async def get_holdings_analytics(user_id: int):
                 AVG((pp.currentPrice - pp.avgPrice) / pp.avgPrice * 100) as avg_performance
             FROM HoldingTag ht
             JOIN PortfolioPosition pp ON ht.positionId = pp.id
-            WHERE ht.userId = ?
+            WHERE ht.userId = %s
             GROUP BY ht.tag
             ORDER BY total_value DESC
         """, (user_id,))
@@ -411,4 +413,4 @@ async def get_holdings_analytics(user_id: int):
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))            
