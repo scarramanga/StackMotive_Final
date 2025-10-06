@@ -1,0 +1,837 @@
+From 8c50920b4f544ef451c101f12f8ce9180e08f3d4 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Mon, 6 Oct 2025 00:04:06 +0000
+Subject: [PATCH] feat: convert 5 main routes to PostgreSQL
+
+Co-Authored-By: andy@sovereignassets.org <andybossnz@gmail.com>
+---
+ server/routes/dca_stop_loss.py       | 59 +++++++++++-----------
+ server/routes/portfolio.py           | 40 +++++++--------
+ server/routes/rebalance_risk.py      | 13 ++---
+ server/routes/rebalance_scheduler.py | 73 ++++++++++++++--------------
+ server/routes/watchlist.py           | 65 +++++++++++++------------
+ 5 files changed, 128 insertions(+), 122 deletions(-)
+
+diff --git a/server/routes/dca_stop_loss.py b/server/routes/dca_stop_loss.py
+index 2b1699b..0ef8205 100644
+--- a/server/routes/dca_stop_loss.py
++++ b/server/routes/dca_stop_loss.py
+@@ -3,8 +3,9 @@ from pydantic import BaseModel
+ from typing import Optional, List, Dict, Any
+ import json
+ from datetime import datetime, timedelta
+-import sqlite3
+-from pathlib import Path
++import psycopg2
++from psycopg2.extras import RealDictCursor
++import os
+ 
+ router = APIRouter()
+ 
+@@ -31,8 +32,8 @@ class RuleExecution(BaseModel):
+ 
+ # Database connection
+ def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
++    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
++    return psycopg2.connect(database_url)
+ 
+ # Agent Memory logging
+ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
+@@ -43,7 +44,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
+         cursor.execute("""
+             INSERT INTO AgentMemory 
+             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+         """, (
+             user_id,
+             "block_10",
+@@ -72,24 +73,24 @@ async def get_user_trade_rules(user_id: int):
+         # Create UserTradeRules table if it doesn't exist
+         cursor.execute("""
+             CREATE TABLE IF NOT EXISTS UserTradeRule (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                id SERIAL PRIMARY KEY,
+                 userId INTEGER NOT NULL,
+                 symbol TEXT NOT NULL,
+                 ruleType TEXT NOT NULL,
+                 threshold REAL NOT NULL,
+                 frequency TEXT,
+                 amount REAL,
+-                enabled BOOLEAN NOT NULL DEFAULT 1,
+-                lastTriggered TEXT,
+-                createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                enabled BOOLEAN NOT NULL DEFAULT true,
++                lastTriggered TIMESTAMPTZ,
++                createdAt TIMESTAMPTZ DEFAULT NOW(),
++                updatedAt TIMESTAMPTZ DEFAULT NOW(),
+                 FOREIGN KEY (userId) REFERENCES User (id)
+             )
+         """)
+         
+         cursor.execute("""
+             SELECT * FROM UserTradeRule 
+-            WHERE userId = ?
++            WHERE userId = %s
+             ORDER BY createdAt DESC
+         """, (user_id,))
+         
+@@ -122,7 +123,7 @@ async def save_trade_rule(rule: UserTradeRule):
+         cursor.execute("""
+             INSERT INTO UserTradeRule 
+             (userId, symbol, ruleType, threshold, frequency, amount, enabled, lastTriggered)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+         """, (
+             rule.userId, rule.symbol, rule.ruleType, rule.threshold,
+             rule.frequency, rule.amount, rule.enabled, rule.lastTriggered
+@@ -165,8 +166,8 @@ async def update_trade_rule(rule_id: int, rule: UserTradeRule):
+         
+         cursor.execute("""
+             UPDATE UserTradeRule 
+-            SET threshold = ?, frequency = ?, amount = ?, enabled = ?, updatedAt = ?
+-            WHERE id = ? AND userId = ?
++            SET threshold = %s, frequency = %s, amount = %s, enabled = %s, updatedAt = %s
++            WHERE id = %s AND userId = %s
+         """, (
+             rule.threshold, rule.frequency, rule.amount, rule.enabled,
+             datetime.now().isoformat(), rule_id, rule.userId
+@@ -209,7 +210,7 @@ async def delete_trade_rule(rule_id: int, user_id: int):
+         # Get rule info for logging
+         cursor.execute("""
+             SELECT symbol, ruleType FROM UserTradeRule 
+-            WHERE id = ? AND userId = ?
++            WHERE id = %s AND userId = %s
+         """, (rule_id, user_id))
+         
+         rule_info = cursor.fetchone()
+@@ -219,7 +220,7 @@ async def delete_trade_rule(rule_id: int, user_id: int):
+         # Delete rule
+         cursor.execute("""
+             DELETE FROM UserTradeRule 
+-            WHERE id = ? AND userId = ?
++            WHERE id = %s AND userId = %s
+         """, (rule_id, user_id))
+         
+         conn.commit()
+@@ -270,7 +271,7 @@ async def execute_trade_rule(rule_id: int, execution: RuleExecution):
+         # Get rule details
+         cursor.execute("""
+             SELECT userId, symbol, ruleType, threshold FROM UserTradeRule 
+-            WHERE id = ?
++            WHERE id = %s
+         """, (rule_id,))
+         
+         rule_data = cursor.fetchone()
+@@ -283,7 +284,7 @@ async def execute_trade_rule(rule_id: int, execution: RuleExecution):
+         cursor.execute("""
+             INSERT INTO RuleExecution 
+             (ruleId, executionType, quantity, price, success, errorMessage)
+-            VALUES (?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s)
+         """, (
+             rule_id, execution.executionType, execution.quantity, 
+             execution.price, execution.success, execution.errorMessage
+@@ -295,8 +296,8 @@ async def execute_trade_rule(rule_id: int, execution: RuleExecution):
+         if execution.success:
+             cursor.execute("""
+                 UPDATE UserTradeRule 
+-                SET lastTriggered = ?, updatedAt = ?
+-                WHERE id = ?
++                SET lastTriggered = %s, updatedAt = %s
++                WHERE id = %s
+             """, (datetime.now().isoformat(), datetime.now().isoformat(), rule_id))
+         
+         conn.commit()
+@@ -345,9 +346,9 @@ async def get_rule_execution_history(user_id: int, limit: int = 20):
+                 utr.threshold
+             FROM RuleExecution re
+             JOIN UserTradeRule utr ON re.ruleId = utr.id
+-            WHERE utr.userId = ?
++            WHERE utr.userId = %s
+             ORDER BY re.executedAt DESC
+-            LIMIT ?
++            LIMIT %s
+         """, (user_id, limit))
+         
+         columns = [description[0] for description in cursor.description]
+@@ -370,7 +371,7 @@ async def check_rule_triggers(user_id: int):
+         # Get enabled rules
+         cursor.execute("""
+             SELECT * FROM UserTradeRule 
+-            WHERE userId = ? AND enabled = 1
++            WHERE userId = %s AND enabled = true
+         """, (user_id,))
+         
+         columns = [description[0] for description in cursor.description]
+@@ -386,7 +387,7 @@ async def check_rule_triggers(user_id: int):
+             # Get current price for the symbol
+             cursor.execute("""
+                 SELECT currentPrice FROM PortfolioPosition 
+-                WHERE symbol = ? AND userId = ?
++                WHERE symbol = %s AND userId = %s
+                 ORDER BY lastUpdated DESC
+                 LIMIT 1
+             """, (symbol, user_id))
+@@ -478,9 +479,9 @@ async def get_rule_analytics(user_id: int):
+                 ruleType,
+                 COUNT(*) as count,
+                 AVG(threshold) as avgThreshold,
+-                SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) as enabledCount
++                SUM(CASE WHEN enabled = true THEN 1 ELSE 0 END) as enabledCount
+             FROM UserTradeRule 
+-            WHERE userId = ?
++            WHERE userId = %s
+             GROUP BY ruleType
+         """, (user_id,))
+         
+@@ -499,12 +500,12 @@ async def get_rule_analytics(user_id: int):
+             SELECT 
+                 utr.ruleType,
+                 COUNT(re.id) as totalExecutions,
+-                SUM(CASE WHEN re.success = 1 THEN 1 ELSE 0 END) as successfulExecutions,
++                SUM(CASE WHEN re.success = true THEN 1 ELSE 0 END) as successfulExecutions,
+                 AVG(re.quantity) as avgQuantity,
+                 AVG(re.price) as avgPrice
+             FROM UserTradeRule utr
+             LEFT JOIN RuleExecution re ON utr.id = re.ruleId
+-            WHERE utr.userId = ?
++            WHERE utr.userId = %s
+             GROUP BY utr.ruleType
+         """, (user_id,))
+         
+@@ -529,4 +530,4 @@ async def get_rule_analytics(user_id: int):
+         }
+         
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e)) 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=str(e))    
+\ No newline at end of file
+diff --git a/server/routes/portfolio.py b/server/routes/portfolio.py
+index 002726e..89eed8a 100644
+--- a/server/routes/portfolio.py
++++ b/server/routes/portfolio.py
+@@ -16,8 +16,9 @@ from typing import List, Optional, Dict, Any
+ from pydantic import BaseModel
+ import json
+ from datetime import datetime, timedelta
+-import sqlite3
+-from pathlib import Path
++import psycopg2
++from psycopg2.extras import RealDictCursor
++import os
+ import random
+ 
+ router = APIRouter()
+@@ -73,8 +74,8 @@ class CombinedPortfolioResponse(BaseModel):
+ 
+ # Database connection
+ def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
++    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
++    return psycopg2.connect(database_url)
+ 
+ # Agent Memory logging
+ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
+@@ -85,7 +86,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
+         cursor.execute("""
+             INSERT INTO AgentMemory 
+             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+         """, (
+             user_id,
+             "block_04",
+@@ -117,7 +118,7 @@ async def get_portfolio_summary(
+         # Create portfolio summary table if it doesn't exist
+         cursor.execute("""
+             CREATE TABLE IF NOT EXISTS PortfolioSummary (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                id SERIAL PRIMARY KEY,
+                 userId INTEGER NOT NULL,
+                 vaultId TEXT,
+                 total_value REAL NOT NULL DEFAULT 0,
+@@ -131,17 +132,17 @@ async def get_portfolio_summary(
+                 total_return REAL DEFAULT 0,
+                 total_return_percent REAL DEFAULT 0,
+                 asset_count INTEGER DEFAULT 0,
+-                last_updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++                last_updated TIMESTAMPTZ DEFAULT NOW(),
++                created_at TIMESTAMPTZ DEFAULT NOW()
+             )
+         """)
+         
+         # Get existing summary or create default
+-        where_clause = "WHERE userId = ?"
++        where_clause = "WHERE userId = %s"
+         params = [user_id]
+         
+         if vaultId:
+-            where_clause += " AND vaultId = ?"
++            where_clause += " AND vaultId = %s"
+             params.append(vaultId)
+         else:
+             where_clause += " AND vaultId IS NULL"
+@@ -174,7 +175,7 @@ async def get_portfolio_summary(
+                 (userId, vaultId, total_value, cash_balance, holdings_value, net_worth,
+                  change_value, change_percent, day_change_value, day_change_percent,
+                  total_return, total_return_percent, asset_count)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             """, (
+                 user_id, vaultId, total_value, cash_balance, holdings_value, net_worth,
+                 change_value, change_percent, day_change_value, day_change_percent,
+@@ -250,7 +251,7 @@ async def get_portfolio_holdings(
+         # Create portfolio holdings table if it doesn't exist
+         cursor.execute("""
+             CREATE TABLE IF NOT EXISTS PortfolioHoldings (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                id SERIAL PRIMARY KEY,
+                 userId INTEGER NOT NULL,
+                 vaultId TEXT,
+                 symbol TEXT NOT NULL,
+@@ -269,18 +270,18 @@ async def get_portfolio_holdings(
+                 day_change_percent REAL DEFAULT 0,
+                 portfolio_percent REAL DEFAULT 0,
+                 broker_account TEXT,
+-                last_updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                last_updated TIMESTAMPTZ DEFAULT NOW(),
++                created_at TIMESTAMPTZ DEFAULT NOW(),
+                 UNIQUE(userId, vaultId, symbol, broker_account)
+             )
+         """)
+         
+         # Get existing holdings
+-        where_clause = "WHERE userId = ?"
++        where_clause = "WHERE userId = %s"
+         params = [user_id]
+         
+         if vaultId:
+-            where_clause += " AND vaultId = ?"
++            where_clause += " AND vaultId = %s"
+             params.append(vaultId)
+         else:
+             where_clause += " AND vaultId IS NULL"
+@@ -346,12 +347,13 @@ async def get_portfolio_holdings(
+                 portfolio_percent = (holding["market_value"] / 125000.00) * 100  # Against total portfolio
+                 
+                 cursor.execute("""
+-                    INSERT OR IGNORE INTO PortfolioHoldings 
++                    INSERT INTO PortfolioHoldings 
+                     (userId, vaultId, symbol, asset_name, asset_class, sector, market,
+                      quantity, average_cost, current_price, market_value, cost_basis,
+                      unrealized_pnl, unrealized_pnl_percent, day_change, day_change_percent,
+                      portfolio_percent)
+-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++                    ON CONFLICT (userId, vaultId, symbol, broker_account) DO NOTHING
+                 """, (
+                     user_id, vaultId, holding["symbol"], holding["asset_name"], 
+                     holding["asset_class"], holding["sector"], holding["market"],
+@@ -686,4 +688,4 @@ async def get_rebalance_recommendations(
+         }
+         
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e)) 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=str(e))        
+\ No newline at end of file
+diff --git a/server/routes/rebalance_risk.py b/server/routes/rebalance_risk.py
+index c615cfa..9ee632f 100644
+--- a/server/routes/rebalance_risk.py
++++ b/server/routes/rebalance_risk.py
+@@ -2,8 +2,9 @@ from fastapi import APIRouter, HTTPException, Query
+ from typing import List, Optional, Dict, Any
+ from datetime import datetime, timedelta
+ import json
+-import sqlite3
+-from pathlib import Path
++import psycopg2
++from psycopg2.extras import RealDictCursor
++import os
+ import random
+ import math
+ from pydantic import BaseModel
+@@ -32,8 +33,8 @@ class RebalanceRiskResponse(BaseModel):
+ 
+ # Database connection
+ def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
++    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
++    return psycopg2.connect(database_url)
+ 
+ # Risk calculation functions
+ def calculate_drift_risk(holdings: List[Dict], target_weights: Dict[str, float]) -> Dict[str, Any]:
+@@ -215,7 +216,7 @@ def get_rebalance_risks(user_id: str) -> RebalanceRiskResponse:
+         cursor.execute("""
+             SELECT symbol, market_value, quantity, asset_class, sector
+             FROM PortfolioHoldings 
+-            WHERE userId = ?
++            WHERE userId = %s
+             ORDER BY market_value DESC
+         """, (user_id,))
+         
+@@ -442,4 +443,4 @@ async def get_risk_summary(
+         raise HTTPException(
+             status_code=500,
+             detail=f"Failed to retrieve risk summary: {str(e)}"
+-        ) 
+\ No newline at end of file
++        )    
+\ No newline at end of file
+diff --git a/server/routes/rebalance_scheduler.py b/server/routes/rebalance_scheduler.py
+index 79d2152..486956a 100644
+--- a/server/routes/rebalance_scheduler.py
++++ b/server/routes/rebalance_scheduler.py
+@@ -3,8 +3,9 @@ from pydantic import BaseModel
+ from typing import Optional, List, Dict, Any
+ import json
+ from datetime import datetime, timedelta
+-import sqlite3
+-from pathlib import Path
++import psycopg2
++from psycopg2.extras import RealDictCursor
++import os
+ 
+ router = APIRouter()
+ 
+@@ -38,8 +39,8 @@ class RebalanceExecution(BaseModel):
+ 
+ # Database connection
+ def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
++    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
++    return psycopg2.connect(database_url)
+ 
+ # Agent Memory logging
+ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: str, input_data: str, output_data: str, metadata: Dict[str, Any]):
+@@ -50,7 +51,7 @@ async def log_to_agent_memory(user_id: int, action_type: str, action_summary: st
+         cursor.execute("""
+             INSERT INTO AgentMemory 
+             (userId, blockId, action, context, userInput, agentResponse, metadata, timestamp, sessionId)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+         """, (
+             user_id,
+             "block_9",
+@@ -139,29 +140,29 @@ async def get_rebalance_schedule(user_id: int):
+         # Create RebalanceSchedule table if it doesn't exist
+         cursor.execute("""
+             CREATE TABLE IF NOT EXISTS RebalanceSchedule (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                id SERIAL PRIMARY KEY,
+                 userId INTEGER NOT NULL,
+-                enabled BOOLEAN NOT NULL DEFAULT 1,
++                enabled BOOLEAN NOT NULL DEFAULT true,
+                 frequency TEXT NOT NULL DEFAULT 'manual',
+                 threshold REAL NOT NULL DEFAULT 5.0,
+-                onlyIfThresholdsExceeded BOOLEAN NOT NULL DEFAULT 1,
++                onlyIfThresholdsExceeded BOOLEAN NOT NULL DEFAULT true,
+                 dayOfWeek INTEGER,
+                 dayOfMonth INTEGER,
+-                excludeWeekends BOOLEAN NOT NULL DEFAULT 1,
+-                allowPartialRebalancing BOOLEAN NOT NULL DEFAULT 0,
++                excludeWeekends BOOLEAN NOT NULL DEFAULT true,
++                allowPartialRebalancing BOOLEAN NOT NULL DEFAULT false,
+                 maxTradesPerSession INTEGER NOT NULL DEFAULT 10,
+                 timeOfDay TEXT NOT NULL DEFAULT '09:30',
+-                lastRebalanceTime TEXT,
+-                nextScheduledTime TEXT,
+-                createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                lastRebalanceTime TIMESTAMPTZ,
++                nextScheduledTime TIMESTAMPTZ,
++                createdAt TIMESTAMPTZ DEFAULT NOW(),
++                updatedAt TIMESTAMPTZ DEFAULT NOW(),
+                 FOREIGN KEY (userId) REFERENCES User (id)
+             )
+         """)
+         
+         cursor.execute("""
+             SELECT * FROM RebalanceSchedule 
+-            WHERE userId = ?
++            WHERE userId = %s
+             ORDER BY createdAt DESC
+             LIMIT 1
+         """, (user_id,))
+@@ -218,7 +219,7 @@ async def save_rebalance_schedule(schedule: RebalanceSchedule):
+         # Check if schedule exists
+         cursor.execute("""
+             SELECT id FROM RebalanceSchedule 
+-            WHERE userId = ?
++            WHERE userId = %s
+         """, (schedule.userId,))
+         
+         existing = cursor.fetchone()
+@@ -227,12 +228,12 @@ async def save_rebalance_schedule(schedule: RebalanceSchedule):
+             # Update existing
+             cursor.execute("""
+                 UPDATE RebalanceSchedule 
+-                SET enabled = ?, frequency = ?, threshold = ?, 
+-                    onlyIfThresholdsExceeded = ?, dayOfWeek = ?, dayOfMonth = ?,
+-                    excludeWeekends = ?, allowPartialRebalancing = ?, 
+-                    maxTradesPerSession = ?, timeOfDay = ?, nextScheduledTime = ?,
+-                    updatedAt = ?
+-                WHERE userId = ?
++                SET enabled = %s, frequency = %s, threshold = %s, 
++                    onlyIfThresholdsExceeded = %s, dayOfWeek = %s, dayOfMonth = %s,
++                    excludeWeekends = %s, allowPartialRebalancing = %s, 
++                    maxTradesPerSession = %s, timeOfDay = %s, nextScheduledTime = %s,
++                    updatedAt = %s
++                WHERE userId = %s
+             """, (
+                 schedule.enabled, schedule.frequency, schedule.threshold,
+                 schedule.onlyIfThresholdsExceeded, schedule.dayOfWeek, schedule.dayOfMonth,
+@@ -249,7 +250,7 @@ async def save_rebalance_schedule(schedule: RebalanceSchedule):
+                 (userId, enabled, frequency, threshold, onlyIfThresholdsExceeded,
+                  dayOfWeek, dayOfMonth, excludeWeekends, allowPartialRebalancing,
+                  maxTradesPerSession, timeOfDay, nextScheduledTime)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             """, (
+                 schedule.userId, schedule.enabled, schedule.frequency, schedule.threshold,
+                 schedule.onlyIfThresholdsExceeded, schedule.dayOfWeek, schedule.dayOfMonth,
+@@ -297,16 +298,16 @@ async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
+         # Create RebalanceExecution table if it doesn't exist
+         cursor.execute("""
+             CREATE TABLE IF NOT EXISTS RebalanceExecution (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                id SERIAL PRIMARY KEY,
+                 userId INTEGER NOT NULL,
+                 scheduleId INTEGER,
+                 executionType TEXT NOT NULL,
+                 portfolioValueBefore REAL NOT NULL,
+                 totalDriftPercent REAL NOT NULL,
+                 tradesExecuted INTEGER NOT NULL DEFAULT 0,
+-                completedSuccessfully BOOLEAN NOT NULL DEFAULT 0,
++                completedSuccessfully BOOLEAN NOT NULL DEFAULT false,
+                 errorMessage TEXT,
+-                executedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                executedAt TIMESTAMPTZ DEFAULT NOW(),
+                 FOREIGN KEY (userId) REFERENCES User (id),
+                 FOREIGN KEY (scheduleId) REFERENCES RebalanceSchedule (id)
+             )
+@@ -318,7 +319,7 @@ async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
+                 assetClass,
+                 SUM(quantity * currentPrice) as totalValue
+             FROM PortfolioPosition 
+-            WHERE userId = ?
++            WHERE userId = %s
+             GROUP BY assetClass
+         """, (user_id,))
+         
+@@ -342,7 +343,7 @@ async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
+         # Get schedule to check thresholds
+         cursor.execute("""
+             SELECT threshold, onlyIfThresholdsExceeded, id FROM RebalanceSchedule 
+-            WHERE userId = ?
++            WHERE userId = %s
+         """, (user_id,))
+         
+         schedule_data = cursor.fetchone()
+@@ -374,7 +375,7 @@ async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
+             INSERT INTO RebalanceExecution 
+             (userId, scheduleId, executionType, portfolioValueBefore, 
+              totalDriftPercent, tradesExecuted, completedSuccessfully, errorMessage)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+         """, (user_id, schedule_id, execution_type, total_value, max_drift,
+               trades_executed, success, error_message))
+         
+@@ -384,8 +385,8 @@ async def trigger_rebalance(user_id: int, execution_type: str = "manual"):
+         if success and schedule_id:
+             cursor.execute("""
+                 UPDATE RebalanceSchedule 
+-                SET lastRebalanceTime = ?, updatedAt = ?
+-                WHERE id = ?
++                SET lastRebalanceTime = %s, updatedAt = %s
++                WHERE id = %s
+             """, (datetime.now().isoformat(), datetime.now().isoformat(), schedule_id))
+         
+         conn.commit()
+@@ -435,9 +436,9 @@ async def get_rebalance_history(user_id: int, limit: int = 20):
+                 rs.frequency as scheduleFrequency
+             FROM RebalanceExecution re
+             LEFT JOIN RebalanceSchedule rs ON re.scheduleId = rs.id
+-            WHERE re.userId = ?
++            WHERE re.userId = %s
+             ORDER BY re.executedAt DESC
+-            LIMIT ?
++            LIMIT %s
+         """, (user_id, limit))
+         
+         columns = [description[0] for description in cursor.description]
+@@ -476,7 +477,7 @@ async def get_rebalance_status(user_id: int):
+                 symbol, assetClass, quantity, currentPrice,
+                 (quantity * currentPrice) as marketValue
+             FROM PortfolioPosition 
+-            WHERE userId = ?
++            WHERE userId = %s
+         """, (user_id,))
+         
+         positions = cursor.fetchall()
+@@ -515,7 +516,7 @@ async def get_rebalance_status(user_id: int):
+         # Get threshold from schedule
+         cursor.execute("""
+             SELECT threshold, nextScheduledTime FROM RebalanceSchedule 
+-            WHERE userId = ?
++            WHERE userId = %s
+         """, (user_id,))
+         
+         schedule_data = cursor.fetchone()
+@@ -537,4 +538,4 @@ async def get_rebalance_status(user_id: int):
+         }
+         
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e)) 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=str(e))    
+\ No newline at end of file
+diff --git a/server/routes/watchlist.py b/server/routes/watchlist.py
+index 110e809..ecc9016 100644
+--- a/server/routes/watchlist.py
++++ b/server/routes/watchlist.py
+@@ -2,8 +2,9 @@ from fastapi import APIRouter, HTTPException, Query
+ from typing import List, Optional, Dict, Any
+ from datetime import datetime
+ import json
+-import sqlite3
+-from pathlib import Path
++import psycopg2
++from psycopg2.extras import RealDictCursor
++import os
+ import uuid
+ from pydantic import BaseModel, Field
+ 
+@@ -56,8 +57,8 @@ class SharedWatchlistResponse(BaseModel):
+ 
+ # Database connection
+ def get_db_connection():
+-    db_path = Path(__file__).parent.parent.parent / "prisma" / "dev.db"
+-    return sqlite3.connect(str(db_path))
++    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/stackmotive")
++    return psycopg2.connect(database_url)
+ 
+ # Database operations
+ def create_watchlist_tables():
+@@ -73,8 +74,8 @@ def create_watchlist_tables():
+             description TEXT,
+             owner_id TEXT NOT NULL,
+             is_public BOOLEAN DEFAULT FALSE,
+-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
++            created_at TIMESTAMPTZ DEFAULT NOW(),
++            updated_at TIMESTAMPTZ DEFAULT NOW()
+         )
+     """)
+     
+@@ -89,7 +90,7 @@ def create_watchlist_tables():
+             change_24h REAL DEFAULT 0,
+             market_cap REAL,
+             notes TEXT,
+-            added_at TEXT NOT NULL DEFAULT (datetime('now')),
++            added_at TIMESTAMPTZ DEFAULT NOW(),
+             FOREIGN KEY (watchlist_id) REFERENCES watchlists (id) ON DELETE CASCADE
+         )
+     """)
+@@ -102,7 +103,7 @@ def create_watchlist_tables():
+             owner_id TEXT NOT NULL,
+             shared_with_id TEXT NOT NULL,
+             is_read_only BOOLEAN DEFAULT FALSE,
+-            shared_at TEXT NOT NULL DEFAULT (datetime('now')),
++            shared_at TIMESTAMPTZ DEFAULT NOW(),
+             FOREIGN KEY (watchlist_id) REFERENCES watchlists (id) ON DELETE CASCADE,
+             UNIQUE(watchlist_id, shared_with_id)
+         )
+@@ -119,11 +120,11 @@ def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
+     # Check if user owns the watchlist or has access to it
+     cursor.execute("""
+         SELECT w.*, 
+-               (CASE WHEN w.owner_id = ? THEN 1 ELSE 0 END) as is_owner,
+-               (CASE WHEN ws.is_read_only = 1 THEN 1 ELSE 0 END) as is_read_only
++               (CASE WHEN w.owner_id = %s THEN 1 ELSE 0 END) as is_owner,
++               (CASE WHEN ws.is_read_only = true THEN 1 ELSE 0 END) as is_read_only
+         FROM watchlists w
+-        LEFT JOIN watchlist_shares ws ON w.id = ws.watchlist_id AND ws.shared_with_id = ?
+-        WHERE w.id = ? AND (w.owner_id = ? OR ws.shared_with_id = ? OR w.is_public = 1)
++        LEFT JOIN watchlist_shares ws ON w.id = ws.watchlist_id AND ws.shared_with_id = %s
++        WHERE w.id = %s AND (w.owner_id = %s OR ws.shared_with_id = %s OR w.is_public = true)
+     """, (user_id, user_id, watchlist_id, user_id, user_id))
+     
+     row = cursor.fetchone()
+@@ -135,7 +136,7 @@ def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
+     cursor.execute("""
+         SELECT symbol, name, price, change_24h, market_cap, notes, added_at
+         FROM watchlist_items
+-        WHERE watchlist_id = ?
++        WHERE watchlist_id = %s
+         ORDER BY added_at DESC
+     """, (watchlist_id,))
+     
+@@ -157,7 +158,7 @@ def get_watchlist_by_id(watchlist_id: str, user_id: str) -> Optional[Watchlist]:
+     cursor.execute("""
+         SELECT shared_with_id
+         FROM watchlist_shares
+-        WHERE watchlist_id = ?
++        WHERE watchlist_id = %s
+     """, (watchlist_id,))
+     
+     shared_with = [row[0] for row in cursor.fetchall()]
+@@ -194,7 +195,7 @@ async def get_user_watchlists(
+         cursor.execute("""
+             SELECT id, name, description, owner_id, is_public, created_at, updated_at
+             FROM watchlists
+-            WHERE owner_id = ?
++            WHERE owner_id = %s
+             ORDER BY updated_at DESC
+         """, (user_id,))
+         
+@@ -216,7 +217,7 @@ async def get_user_watchlists(
+                        w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
+                 FROM watchlists w
+                 JOIN watchlist_shares ws ON w.id = ws.watchlist_id
+-                WHERE ws.shared_with_id = ?
++                WHERE ws.shared_with_id = %s
+                 ORDER BY ws.shared_at DESC
+             """, (user_id,))
+             
+@@ -257,7 +258,7 @@ async def create_watchlist(
+         # Create watchlist
+         cursor.execute("""
+             INSERT INTO watchlists (id, name, description, owner_id, is_public, created_at, updated_at)
+-            VALUES (?, ?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s, %s)
+         """, (
+             watchlist_id,
+             request.name,
+@@ -274,7 +275,7 @@ async def create_watchlist(
+             cursor.execute("""
+                 INSERT INTO watchlist_items 
+                 (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+             """, (
+                 item_id,
+                 watchlist_id,
+@@ -323,32 +324,32 @@ async def update_watchlist(
+         update_values = []
+         
+         if request.name is not None:
+-            update_fields.append("name = ?")
++            update_fields.append("name = %s")
+             update_values.append(request.name)
+         
+         if request.description is not None:
+-            update_fields.append("description = ?")
++            update_fields.append("description = %s")
+             update_values.append(request.description)
+         
+         if request.isPublic is not None:
+-            update_fields.append("is_public = ?")
++            update_fields.append("is_public = %s")
+             update_values.append(request.isPublic)
+         
+         if update_fields:
+-            update_fields.append("updated_at = ?")
++            update_fields.append("updated_at = %s")
+             update_values.append(datetime.now().isoformat())
+             update_values.append(watchlist_id)
+             
+             cursor.execute(f"""
+                 UPDATE watchlists 
+                 SET {', '.join(update_fields)}
+-                WHERE id = ?
++                WHERE id = %s
+             """, update_values)
+         
+         # Update items if provided
+         if request.items is not None:
+             # Delete existing items
+-            cursor.execute("DELETE FROM watchlist_items WHERE watchlist_id = ?", (watchlist_id,))
++            cursor.execute("DELETE FROM watchlist_items WHERE watchlist_id = %s", (watchlist_id,))
+             
+             # Add new items
+             for item in request.items:
+@@ -356,7 +357,7 @@ async def update_watchlist(
+                 cursor.execute("""
+                     INSERT INTO watchlist_items 
+                     (id, watchlist_id, symbol, name, price, change_24h, market_cap, notes, added_at)
+-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 """, (
+                     item_id,
+                     watchlist_id,
+@@ -402,7 +403,7 @@ async def delete_watchlist(
+         cursor = conn.cursor()
+         
+         # Delete watchlist (items and shares will be deleted by CASCADE)
+-        cursor.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
++        cursor.execute("DELETE FROM watchlists WHERE id = %s", (watchlist_id,))
+         
+         conn.commit()
+         conn.close()
+@@ -437,7 +438,7 @@ async def share_watchlist(
+         
+         cursor.execute("""
+             SELECT id FROM watchlist_shares
+-            WHERE watchlist_id = ? AND shared_with_id = ?
++            WHERE watchlist_id = %s AND shared_with_id = %s
+         """, (request.watchlistId, request.recipientId))
+         
+         if cursor.fetchone():
+@@ -449,7 +450,7 @@ async def share_watchlist(
+         
+         cursor.execute("""
+             INSERT INTO watchlist_shares (id, watchlist_id, owner_id, shared_with_id, is_read_only, shared_at)
+-            VALUES (?, ?, ?, ?, ?, ?)
++            VALUES (%s, %s, %s, %s, %s, %s)
+         """, (
+             share_id,
+             request.watchlistId,
+@@ -491,7 +492,7 @@ async def get_shared_watchlists(
+                    w.created_at, w.updated_at, ws.shared_at, ws.is_read_only
+             FROM watchlists w
+             JOIN watchlist_shares ws ON w.id = ws.watchlist_id
+-            WHERE ws.shared_with_id = ?
++            WHERE ws.shared_with_id = %s
+             ORDER BY ws.shared_at DESC
+         """, (user_id,))
+         
+@@ -536,7 +537,7 @@ async def unshare_watchlist(
+         # Remove share record
+         cursor.execute("""
+             DELETE FROM watchlist_shares
+-            WHERE watchlist_id = ? AND shared_with_id = ?
++            WHERE watchlist_id = %s AND shared_with_id = %s
+         """, (watchlist_id, recipient_id))
+         
+         if cursor.rowcount == 0:
+@@ -592,7 +593,7 @@ async def get_watchlist_permissions(
+         cursor.execute("""
+             SELECT shared_with_id, is_read_only, shared_at
+             FROM watchlist_shares
+-            WHERE watchlist_id = ?
++            WHERE watchlist_id = %s
+         """, (watchlist_id,))
+         
+         shares = []
+@@ -621,4 +622,4 @@ async def get_watchlist_permissions(
+     except HTTPException:
+         raise
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=f"Failed to get permissions: {str(e)}") 
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail=f"Failed to get permissions: {str(e)}")        
+\ No newline at end of file
+-- 
+2.34.1
+
